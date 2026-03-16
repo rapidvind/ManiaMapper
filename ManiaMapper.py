@@ -19,6 +19,8 @@ Usage:
     python ManiaMapper.py song.mp3
     python ManiaMapper.py song.mp3 --output my_map.osz
     python ManiaMapper.py song.mp3 --nn mania_model.pt
+    python ManiaMapper.py --ui
+    python ManiaMapper.py song.mp3 --ui
 """
 
 import os, sys, argparse, zipfile
@@ -182,20 +184,6 @@ def generate_notes(audio_data, nn_model_data, fill):
     """
     Feed audio features through the trained LSTM and place notes based on the
     model's confidence, cutting the least certain ones for lower difficulties.
-
-    The model outputs a probability for each of the 4 columns at every 16th-note
-    position. These probabilities encode everything — not just timing but which
-    columns fire together (chords), which repeat (jacks), which alternate
-    (streams). Column identity IS the pattern, so it is used exactly as the
-    model outputs it.
-
-    Difficulty works by thresholding: a higher threshold keeps only the notes
-    the model is most confident about. The main structural notes (high
-    probability) always survive. The marginal ones are cut first.
-    No randomness — same song + same difficulty always produces the same map.
-
-    The only non-model constraint is MIN_GAP_MS: same column cannot fire twice
-    within 80ms (physical human limit).
     """
     try:
         import torch
@@ -229,7 +217,6 @@ def generate_notes(audio_data, nn_model_data, fill):
         f[_NN_N_MFCC + 4] = float(np.cos(2 * np.pi * phase))
         return f
 
-    # Build 16th-note position grid
     positions = []
     for t_beat in beat_times:
         for s in range(_NN_SUBDIV):
@@ -241,22 +228,15 @@ def generate_notes(audio_data, nn_model_data, fill):
     if not positions:
         return []
 
-    # Single forward pass — the LSTM's recurrent state carries context across
-    # the whole song, so it naturally understands section structure.
     features = np.stack([_feat_at(t) for t in positions])
     X        = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        probs = torch.sigmoid(model(X))[0].cpu().numpy()   # (T, 4)
+        probs = torch.sigmoid(model(X))[0].cpu().numpy()
 
-    # Percentile threshold: keep the top `fill` fraction of all model predictions.
-    # e.g. fill=0.38 (Insane) → threshold = 62nd percentile of all probs.
-    # The model's confidence ranking decides which notes are most important;
-    # difficulty just controls how far down that ranked list we go.
     threshold = float(np.percentile(probs, (1.0 - fill) * 100))
-    threshold = max(0.20, threshold)   # never accept very uncertain predictions
+    threshold = max(0.20, threshold)
 
-    # Collect every (prob, time, col) above the threshold
     candidates = [
         (float(probs[i, col]), t, col)
         for i, t in enumerate(positions)
@@ -264,20 +244,17 @@ def generate_notes(audio_data, nn_model_data, fill):
         if probs[i, col] >= threshold
     ]
 
-    # Sort highest confidence first so that when two notes on the same column
-    # conflict with the physical gap, the more important one is kept.
     candidates.sort(key=lambda c: c[0], reverse=True)
 
-    col_busy = {}   # col → time after which the column is free again
+    col_busy = {}
     placed   = []
 
     for _, t, col in candidates:
         if col_busy.get(col, -9999.0) > t:
-            continue   # physical gap — skip, less confident note loses
+            continue
         placed.append((round(t), col, False, 0))
         col_busy[col] = t + MIN_GAP_MS
 
-    # Return in time order
     return sorted(placed, key=lambda n: n[0])
 
 
@@ -378,14 +355,466 @@ def build_osz(settings, audio_data, notes, sv_points, output_path):
     return count
 
 
+# ─── GUI ─────────────────────────────────────────────────────────────────────
+
+class ManiaMapperGUI:
+    # osu!-inspired palette
+    PINK       = "#ff66ab"
+    PINK_HOV   = "#e0508f"
+    PINK_DARK  = "#cc3d7a"
+    PINK_LT    = "#ffe6f2"
+    HEADER_BG  = "#2d1b33"
+    HEADER_SUB = "#c49dbf"
+    BG         = "#f7f4fa"
+    CARD       = "#ffffff"
+    DARK       = "#2d2d2d"
+    MUTED      = "#888888"
+    BORDER     = "#e6ddf0"
+    INPUT_BG   = "#faf6fd"
+    SUCCESS    = "#4caf82"
+
+    def __init__(self, root, audio_path=None):
+        self.root = root
+        self.audio_path = audio_path
+        self._open_folder_btn = None
+
+        import queue as _queue
+        self._q = _queue.Queue()
+
+        self._setup_window()
+        self._build_ui()
+
+        if audio_path:
+            self._audio_var.set(os.path.basename(audio_path))
+            stem = os.path.splitext(os.path.basename(audio_path))[0]
+            self._title_var.set(stem)
+
+        self._poll_queue()
+
+    def _setup_window(self):
+        self.root.title("ManiaMapper")
+        W, H = 480, 580
+        self.root.geometry(f"{W}x{H}")
+        self.root.resizable(False, False)
+        self.root.configure(bg=self.BG)
+        self.root.update_idletasks()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        self.root.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2}")
+
+    # ── layout ──────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        self._build_header()
+        self._build_card()
+
+    def _build_header(self):
+        hdr = tk.Frame(self.root, bg=self.HEADER_BG, height=110)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+
+        # pink dot accent row
+        dot_row = tk.Frame(hdr, bg=self.HEADER_BG)
+        dot_row.pack(pady=(14, 0))
+        for _ in range(3):
+            tk.Label(dot_row, text="●", font=("Segoe UI", 7),
+                     fg=self.PINK, bg=self.HEADER_BG).pack(side="left", padx=3)
+
+        tk.Label(hdr, text="ManiaMapper",
+                 font=("Segoe UI", 26, "bold"),
+                 fg=self.PINK, bg=self.HEADER_BG).pack(pady=(4, 0))
+        tk.Label(hdr, text="osu!mania AI Map Generator  ·  4K",
+                 font=("Segoe UI", 9),
+                 fg=self.HEADER_SUB, bg=self.HEADER_BG).pack()
+
+    def _build_card(self):
+        import tkinter.ttk as ttk
+
+        # outer frame with soft shadow effect (border trick)
+        outer = tk.Frame(self.root, bg=self.BORDER)
+        outer.pack(fill="both", expand=True, padx=18, pady=18)
+
+        card = tk.Frame(outer, bg=self.CARD, padx=28, pady=22)
+        card.pack(fill="both", expand=True, padx=1, pady=1)
+
+        # ── audio file row ───────────────────────────────────────────────
+        self._audio_var = tk.StringVar(value="No file selected")
+        self._make_row(card, "Audio File", widget=self._build_audio_row(card))
+
+        # divider
+        tk.Frame(card, bg=self.BORDER, height=1).pack(fill="x", pady=(4, 14))
+
+        # ── fields ──────────────────────────────────────────────────────
+        self._title_var  = tk.StringVar()
+        self._artist_var = tk.StringVar(value="Unknown")
+        self._make_entry_row(card, "Song Title", self._title_var)
+        self._make_entry_row(card, "Artist",     self._artist_var)
+
+        # ── difficulty ──────────────────────────────────────────────────
+        self._diff_var = tk.StringVar(value="Hard")
+        diff_frame = tk.Frame(card, bg=self.CARD)
+        self._make_row(card, "Difficulty", widget=self._build_diff_row(card))
+
+        # ── SV toggle ───────────────────────────────────────────────────
+        self._sv_var = tk.BooleanVar(value=False)
+        self._make_row(card, "Speed Variation", widget=self._build_sv_row(card))
+
+        # spacer
+        tk.Frame(card, bg=self.CARD, height=10).pack()
+
+        # ── generate button ─────────────────────────────────────────────
+        self._gen_btn = tk.Button(
+            card, text="✨   Generate Map",
+            command=self._on_generate,
+            font=("Segoe UI", 13, "bold"),
+            fg="white", bg=self.PINK,
+            activebackground=self.PINK_HOV, activeforeground="white",
+            relief="flat", cursor="hand2",
+            pady=11, padx=20,
+        )
+        self._gen_btn.pack(fill="x", pady=(0, 14))
+        self._bind_hover(self._gen_btn, self.PINK, self.PINK_HOV)
+
+        # ── progress area ───────────────────────────────────────────────
+        self._prog_outer = tk.Frame(card, bg=self.CARD)
+        self._prog_outer.pack(fill="x")
+
+        style = ttk.Style()
+        style.theme_use("default")
+        style.configure(
+            "Mania.Horizontal.TProgressbar",
+            troughcolor=self.BORDER,
+            background=self.PINK,
+            borderwidth=0,
+            thickness=10,
+        )
+
+        self._prog_var = tk.DoubleVar(value=0)
+        self._prog_bar = ttk.Progressbar(
+            self._prog_outer,
+            variable=self._prog_var,
+            style="Mania.Horizontal.TProgressbar",
+            maximum=100,
+        )
+        self._prog_bar.pack(fill="x", pady=(0, 5))
+
+        status_row = tk.Frame(self._prog_outer, bg=self.CARD)
+        status_row.pack(fill="x")
+
+        self._status_var = tk.StringVar(value="")
+        tk.Label(status_row, textvariable=self._status_var,
+                 font=("Segoe UI", 9), fg=self.MUTED,
+                 bg=self.CARD, anchor="w").pack(side="left", fill="x", expand=True)
+
+        self._pct_var = tk.StringVar(value="")
+        tk.Label(status_row, textvariable=self._pct_var,
+                 font=("Segoe UI", 9, "bold"), fg=self.PINK,
+                 bg=self.CARD, anchor="e").pack(side="right")
+
+        self._prog_outer.pack_forget()
+
+    # ── sub-widget builders ──────────────────────────────────────────────────
+
+    def _build_audio_row(self, parent):
+        f = tk.Frame(parent, bg=self.CARD)
+        lbl = tk.Label(f, textvariable=self._audio_var,
+                       font=("Segoe UI", 9), fg=self.DARK,
+                       bg=self.INPUT_BG, anchor="w", padx=8,
+                       relief="flat",
+                       highlightthickness=1, highlightbackground=self.BORDER)
+        lbl.pack(side="left", fill="x", expand=True, ipady=5)
+
+        btn = tk.Button(f, text="Browse…",
+                        command=self._browse,
+                        font=("Segoe UI", 9), fg=self.PINK, bg=self.CARD,
+                        relief="flat", cursor="hand2", padx=6,
+                        activeforeground=self.PINK_DARK, activebackground=self.CARD)
+        btn.pack(side="right", padx=(6, 0))
+        return f
+
+    def _build_diff_row(self, parent):
+        f = tk.Frame(parent, bg=self.CARD)
+        for diff in ("Easy", "Normal", "Hard", "Insane"):
+            self._make_diff_btn(f, diff)
+        return f
+
+    def _make_diff_btn(self, parent, diff):
+        colors = {
+            "Easy":   "#5cb85c",
+            "Normal": "#5bc0de",
+            "Hard":   "#f0ad4e",
+            "Insane": self.PINK,
+        }
+        c = colors[diff]
+
+        def select():
+            self._diff_var.set(diff)
+            for d, b in self._diff_btns.items():
+                active = d == diff
+                b.config(
+                    bg=colors[d] if active else self.CARD,
+                    fg="white"   if active else self.MUTED,
+                    relief="flat",
+                    highlightbackground=colors[d] if active else self.BORDER,
+                )
+
+        if not hasattr(self, "_diff_btns"):
+            self._diff_btns = {}
+
+        btn = tk.Button(
+            parent, text=diff,
+            command=select,
+            font=("Segoe UI", 9, "bold"),
+            fg=self.MUTED if diff != "Hard" else "white",
+            bg=colors["Hard"] if diff == "Hard" else self.CARD,
+            relief="flat", cursor="hand2", padx=10, pady=5,
+            highlightthickness=1,
+            highlightbackground=c if diff == "Hard" else self.BORDER,
+        )
+        btn.pack(side="left", padx=(0, 6))
+        self._diff_btns[diff] = btn
+
+    def _build_sv_row(self, parent):
+        f = tk.Frame(parent, bg=self.CARD)
+
+        self._sv_toggle_bg = tk.Frame(f, bg=self.BORDER, width=44, height=22,
+                                       cursor="hand2")
+        self._sv_toggle_bg.pack(side="left")
+        self._sv_toggle_bg.pack_propagate(False)
+
+        self._sv_knob = tk.Frame(self._sv_toggle_bg, bg=self.MUTED,
+                                  width=18, height=18)
+        self._sv_knob.place(x=2, y=2)
+
+        self._sv_lbl = tk.Label(f, text="Disabled — notes use constant scroll speed",
+                                 font=("Segoe UI", 9), fg=self.MUTED, bg=self.CARD)
+        self._sv_lbl.pack(side="left", padx=(10, 0))
+
+        self._sv_toggle_bg.bind("<Button-1>", lambda _: self._toggle_sv())
+        self._sv_knob.bind("<Button-1>",      lambda _: self._toggle_sv())
+        return f
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _make_row(self, parent, label, widget):
+        row = tk.Frame(parent, bg=self.CARD)
+        row.pack(fill="x", pady=(0, 10))
+        tk.Label(row, text=label,
+                 font=("Segoe UI", 9, "bold"), fg=self.MUTED,
+                 bg=self.CARD, width=14, anchor="w").pack(side="left")
+        widget.pack(side="left", fill="x", expand=True)
+
+    def _make_entry_row(self, parent, label, var):
+        row = tk.Frame(parent, bg=self.CARD)
+        row.pack(fill="x", pady=(0, 10))
+        tk.Label(row, text=label,
+                 font=("Segoe UI", 9, "bold"), fg=self.MUTED,
+                 bg=self.CARD, width=14, anchor="w").pack(side="left")
+        e = tk.Entry(row, textvariable=var,
+                     font=("Segoe UI", 10), fg=self.DARK,
+                     bg=self.INPUT_BG, relief="flat",
+                     highlightthickness=1, highlightbackground=self.BORDER,
+                     highlightcolor=self.PINK,
+                     insertbackground=self.PINK)
+        e.pack(side="left", fill="x", expand=True, ipady=5)
+
+    def _bind_hover(self, widget, normal, hover):
+        widget.bind("<Enter>", lambda _: widget.config(bg=hover))
+        widget.bind("<Leave>", lambda _: widget.config(bg=normal))
+
+    def _toggle_sv(self):
+        new_val = not self._sv_var.get()
+        self._sv_var.set(new_val)
+        if new_val:
+            self._sv_toggle_bg.config(bg=self.PINK)
+            self._sv_knob.config(bg="white")
+            self._sv_knob.place(x=24, y=2)
+            self._sv_lbl.config(
+                text="Enabled — scroll speed follows song energy",
+                fg=self.PINK)
+        else:
+            self._sv_toggle_bg.config(bg=self.BORDER)
+            self._sv_knob.config(bg=self.MUTED)
+            self._sv_knob.place(x=2, y=2)
+            self._sv_lbl.config(
+                text="Disabled — notes use constant scroll speed",
+                fg=self.MUTED)
+
+    def _browse(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Select audio file",
+            filetypes=[("Audio files", "*.mp3 *.ogg *.wav *.flac"), ("All", "*.*")]
+        )
+        if not path:
+            return
+        self.audio_path = path
+        self._audio_var.set(os.path.basename(path))
+        if not self._title_var.get():
+            self._title_var.set(os.path.splitext(os.path.basename(path))[0])
+
+    # ── generation ───────────────────────────────────────────────────────────
+
+    def _on_generate(self):
+        from tkinter import messagebox
+        if not self.audio_path or not os.path.isfile(self.audio_path):
+            messagebox.showerror("No audio", "Please select an audio file first.")
+            return
+
+        settings = {
+            "title":      self._title_var.get().strip() or
+                          os.path.splitext(os.path.basename(self.audio_path))[0],
+            "artist":     self._artist_var.get().strip() or "Unknown",
+            "difficulty": self._diff_var.get(),
+            "sv":         self._sv_var.get(),
+            "audio_path": self.audio_path,
+        }
+
+        # reset state
+        if self._open_folder_btn:
+            self._open_folder_btn.destroy()
+            self._open_folder_btn = None
+
+        self._gen_btn.config(state="disabled", text="Generating…", bg="#cc5590")
+        self._prog_var.set(0)
+        self._status_var.set("Starting…")
+        self._pct_var.set("0%")
+        self._prog_outer.pack(fill="x")
+
+        import threading
+        threading.Thread(target=self._worker, args=(settings,), daemon=True).start()
+
+    def _worker(self, settings):
+        def upd(pct, msg):
+            self._q.put(("progress", pct, msg))
+
+        try:
+            scripts_dir   = os.path.dirname(os.path.abspath(__file__))
+            nn_model_path = os.path.join(scripts_dir, "mania_model.pt")
+
+            upd(5,  "Loading model…")
+            nn = load_nn_model(nn_model_path)
+            if nn is None:
+                self._q.put(("error", "Model not found. Run ManiaNNTrainer.py first."))
+                return
+
+            upd(15, f"Analysing audio  ·  {os.path.basename(settings['audio_path'])}")
+            audio = analyze_audio(settings["audio_path"])
+
+            upd(55, "Running LSTM — generating notes…")
+            d     = DIFFICULTY_PRESETS[settings["difficulty"]]
+            notes = generate_notes(audio, nn, fill=d["fill"])
+
+            upd(78, "Generating SV points…" if settings["sv"] else "Skipping SV…")
+            sv = generate_sv_points(audio) if settings["sv"] else []
+
+            upd(90, "Packaging .osz…")
+            safe_t = "".join(c for c in settings["title"]  if c.isalnum() or c in " -_")
+            safe_a = "".join(c for c in settings["artist"] if c.isalnum() or c in " -_")
+            out    = os.path.join(
+                os.path.dirname(os.path.abspath(settings["audio_path"])),
+                f"{safe_a} - {safe_t} [{settings['difficulty']}].osz"
+            )
+            count = build_osz(settings, audio, notes, sv, out)
+
+            upd(100, f"Done!  {count} notes  ·  {audio['bpm_orig']:.1f} BPM")
+            self._q.put(("done", count, out, audio["bpm_orig"]))
+
+        except Exception as exc:
+            self._q.put(("error", str(exc)))
+
+    def _poll_queue(self):
+        try:
+            import queue as _queue
+            while True:
+                msg = self._q.get_nowait()
+                kind = msg[0]
+                if kind == "progress":
+                    _, pct, text = msg
+                    self._prog_var.set(pct)
+                    self._status_var.set(text)
+                    self._pct_var.set(f"{int(pct)}%")
+                elif kind == "done":
+                    _, count, out_path, bpm = msg
+                    self._prog_var.set(100)
+                    self._pct_var.set("100%")
+                    self._gen_btn.config(
+                        state="normal", text="✨   Generate Map", bg=self.PINK)
+                    self._on_done(count, out_path, bpm)
+                elif kind == "error":
+                    from tkinter import messagebox
+                    _, err = msg
+                    self._gen_btn.config(
+                        state="normal", text="✨   Generate Map", bg=self.PINK)
+                    self._status_var.set(f"Error: {err}")
+                    self._pct_var.set("")
+                    messagebox.showerror("ManiaMapper error", err)
+        except Exception:
+            pass
+        self.root.after(80, self._poll_queue)
+
+    def _on_done(self, count, out_path, bpm):
+        self._status_var.set(
+            f"✓  {count} notes  ·  {bpm:.1f} BPM  ·  {os.path.basename(out_path)}")
+        self._status_var_lbl_color(self.SUCCESS)
+
+        self._open_folder_btn = tk.Button(
+            self._prog_outer,
+            text="Open folder  ↗",
+            command=lambda: os.startfile(os.path.dirname(out_path)),
+            font=("Segoe UI", 9, "bold"),
+            fg=self.PINK, bg=self.CARD,
+            relief="flat", cursor="hand2",
+            activeforeground=self.PINK_DARK, activebackground=self.CARD,
+        )
+        self._open_folder_btn.pack(anchor="e", pady=(4, 0))
+
+    def _status_var_lbl_color(self, color):
+        # walk the prog_outer children to find the status label
+        for child in self._prog_outer.winfo_children():
+            if isinstance(child, tk.Frame):
+                for sub in child.winfo_children():
+                    if isinstance(sub, tk.Label) and sub.cget("textvariable") == str(self._status_var):
+                        sub.config(fg=color)
+                        return
+
+
+# ─── UI LAUNCHER ─────────────────────────────────────────────────────────────
+
+def _launch_ui(audio_path=None):
+    try:
+        import tkinter as tk
+    except ImportError:
+        print("ERROR: tkinter is not available in this Python installation.")
+        sys.exit(1)
+
+    root = tk.Tk()
+    ManiaMapperGUI(root, audio_path=audio_path)
+    root.mainloop()
+
+
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="4K osu!mania map generator")
-    parser.add_argument("audio",          help="Audio file (mp3, ogg, wav, flac)")
-    parser.add_argument("--output", "-o", help="Output .osz path")
-    parser.add_argument("--nn",           help="Path to mania_model.pt")
+    parser.add_argument("audio", nargs="?",    help="Audio file (mp3, ogg, wav, flac)")
+    parser.add_argument("--output", "-o",      help="Output .osz path")
+    parser.add_argument("--nn",                help="Path to mania_model.pt")
+    parser.add_argument("--ui", action="store_true",
+                        help="Open graphical UI instead of CLI prompts")
     args = parser.parse_args()
+
+    # ── GUI mode ──────────────────────────────────────────────────────────────
+    if args.ui:
+        if args.audio and not os.path.isfile(args.audio):
+            print(f"ERROR: File not found: {args.audio}")
+            sys.exit(1)
+        _launch_ui(args.audio)
+        return
+
+    # ── CLI mode ──────────────────────────────────────────────────────────────
+    if not args.audio:
+        parser.error("audio file is required (or use --ui for the graphical interface)")
 
     if not os.path.isfile(args.audio):
         print(f"ERROR: File not found: {args.audio}")
@@ -439,4 +868,11 @@ def main():
 
 
 if __name__ == "__main__":
+    # need tk at module level for ManiaMapperGUI class body references
+    try:
+        import tkinter as tk
+        import tkinter.ttk as ttk
+    except ImportError:
+        tk = None
+        ttk = None
     main()
