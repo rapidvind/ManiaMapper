@@ -17,18 +17,22 @@ KEYS   = 4
 COL_X  = [64, 192, 320, 448]
 
 DIFFICULTY_PRESETS = {
-    "Easy":   {"hp": 6, "od": 6,  "fill": 0.08},
-    "Normal": {"hp": 7, "od": 7,  "fill": 0.15},
-    "Hard":   {"hp": 8, "od": 8,  "fill": 0.25},
-    "Insane": {"hp": 9, "od": 9,  "fill": 0.38},
+    "Easy":   {"hp": 6, "od": 6,  "fill": 0.04, "max_chord": 1},
+    "Normal": {"hp": 7, "od": 7,  "fill": 0.07, "max_chord": 2},
+    "Hard":   {"hp": 8, "od": 8,  "fill": 0.12, "max_chord": 3},
+    "Insane": {"hp": 9, "od": 9,  "fill": 0.16, "max_chord": 3},
 }
 
-MIN_GAP_MS   = 40.0          # 32nd-note grid minimum gap
-_NN_N_MEL    = 80
-_NN_FEAT_DIM = _NN_N_MEL + 3  # mel(80) + onset(1) + sin_phase(1) + cos_phase(1) = 83
-_NN_SUBDIV   = 8              # 32nd-note grid — must match ManiaNNTrainer.py
-_NN_SR       = 22050          # fixed sample rate
-_NN_HOP      = 512
+MIN_GAP_MS        = 40.0
+_NN_SR            = 22050
+_NN_HOP           = 512
+_NN_SUBDIV        = 4          # 16th-note inference grid
+_NN_N_MEL         = 80
+_NN_N_SC          = 7
+_NN_N_CHROMA      = 12
+_NN_FEAT_DIM_AUDIO = _NN_N_MEL + 1 + _NN_N_SC + _NN_N_CHROMA + 1 + 1 + 6  # 108
+_NN_FEAT_DIM_CTX  = 16         # zeros at inference (no sibling maps)
+_NN_FEAT_DIM      = _NN_FEAT_DIM_AUDIO + _NN_FEAT_DIM_CTX               # 124
 
 DIFF_IDX = {"Easy": 0, "Normal": 1, "Hard": 2, "Insane": 3}
 
@@ -85,31 +89,51 @@ def analyze_audio(audio_path):
     print("[1/3] Analysing audio...")
     y, sr = librosa.load(audio_path, sr=_NN_SR, mono=True)
     tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
-    beat_times = librosa.frames_to_time(beat_frames, sr=sr) * 1000
+    beat_times  = librosa.frames_to_time(beat_frames, sr=sr) * 1000
+    bpm_orig    = float(np.atleast_1d(tempo)[0])
+    beat_length = 60000.0 / bpm_orig
+    duration_ms = len(y) / sr * 1000
+    hop         = _NN_HOP
 
-    hop = _NN_HOP
-
-    # mel spectrogram (same as trainer)
+    # ── mel spectrogram ────────────────────────────────────────────────────────
     mel    = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=_NN_N_MEL, hop_length=hop)
     mel_db = librosa.power_to_db(mel, ref=np.max)
     mel_db = (mel_db - mel_db.mean()) / (mel_db.std() + 1e-9)
 
-    # onset strength
+    # ── onset strength ─────────────────────────────────────────────────────────
     onset = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
     onset = (onset - onset.mean()) / (onset.std() + 1e-9)
+
+    # ── spectral contrast ──────────────────────────────────────────────────────
+    try:
+        sc = librosa.feature.spectral_contrast(y=y, sr=sr, hop_length=hop)
+        sc = (sc - sc.mean(axis=1, keepdims=True)) / (sc.std(axis=1, keepdims=True) + 1e-9)
+    except Exception:
+        sc = np.zeros((_NN_N_SC, mel_db.shape[1]), dtype=np.float32)
+
+    # ── chroma CQT ─────────────────────────────────────────────────────────────
+    try:
+        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
+        chroma = (chroma - chroma.mean(axis=1, keepdims=True)) / (chroma.std(axis=1, keepdims=True) + 1e-9)
+    except Exception:
+        chroma = np.zeros((_NN_N_CHROMA, mel_db.shape[1]), dtype=np.float32)
+
+    # ── RMS (also kept for SV) ─────────────────────────────────────────────────
+    rms_raw   = librosa.feature.rms(y=y, hop_length=hop)[0]
+    rms_times = librosa.frames_to_time(np.arange(len(rms_raw)), sr=sr, hop_length=hop) * 1000
+    rms_feat  = (rms_raw - rms_raw.mean()) / (rms_raw.std() + 1e-9)
+
+    # ── spectral flatness ──────────────────────────────────────────────────────
+    try:
+        flat = librosa.feature.spectral_flatness(y=y, hop_length=hop)[0]
+        flat = (flat - flat.mean()) / (flat.std() + 1e-9)
+    except Exception:
+        flat = np.zeros(mel_db.shape[1], dtype=np.float32)
 
     n_frames    = mel_db.shape[1]
     frame_times = librosa.frames_to_time(np.arange(n_frames), sr=sr, hop_length=hop) * 1000
 
-    # rms for SV (kept for generate_sv_points)
-    rms       = librosa.feature.rms(y=y, hop_length=hop)[0]
-    rms_times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop) * 1000
-
-    bpm_orig    = float(np.atleast_1d(tempo)[0])
-    beat_length = 60000.0 / bpm_orig
-    duration_ms = len(y) / sr * 1000
-
-    # uniform beat grid from first detected beat (no drift)
+    # ── uniform beat grid (inference at 16th-note resolution) ─────────────────
     beat0_ms  = float(beat_times[0]) if len(beat_times) else 0.0
     step_ms   = beat_length / _NN_SUBDIV
     positions = []
@@ -118,24 +142,50 @@ def analyze_audio(audio_path):
         positions.append(t)
         t += step_ms
 
+    # ── feature matrix at each grid position ──────────────────────────────────
+    def feat_at(t_ms):
+        idx = min(int(np.searchsorted(frame_times, t_ms)), n_frames - 1)
+        f   = np.zeros(_NN_FEAT_DIM_AUDIO, dtype=np.float32)
+        f[:_NN_N_MEL]                                         = mel_db[:, idx]
+        f[_NN_N_MEL]                                          = onset[idx]
+        f[_NN_N_MEL+1 : _NN_N_MEL+1+_NN_N_SC]               = sc[:, idx]
+        f[_NN_N_MEL+1+_NN_N_SC : _NN_N_MEL+1+_NN_N_SC+_NN_N_CHROMA] = chroma[:, idx]
+        f[_NN_N_MEL+1+_NN_N_SC+_NN_N_CHROMA]                 = rms_feat[idx]
+        f[_NN_N_MEL+1+_NN_N_SC+_NN_N_CHROMA+1]               = flat[idx]
+        for k, scale in enumerate([1, 2, 4]):
+            period = beat_length * scale
+            phase  = (t_ms % period) / (period + 1e-9)
+            base   = _NN_N_MEL + 1 + _NN_N_SC + _NN_N_CHROMA + 2 + k * 2
+            f[base]   = float(np.sin(2 * np.pi * phase))
+            f[base+1] = float(np.cos(2 * np.pi * phase))
+        return f
+
+    feat_audio = np.stack([feat_at(t) for t in positions])   # (T, 108)
+    # Pad with zeros for cross-diff context (no sibling maps at inference)
+    feat_full  = np.concatenate(
+        [feat_audio, np.zeros((len(positions), _NN_FEAT_DIM_CTX), dtype=np.float32)],
+        axis=1)                                                # (T, 124)
+
     print(f"   BPM: {bpm_orig:.1f}  |  Grid steps: {len(positions)}")
     return dict(bpm_orig=bpm_orig, beat_length=beat_length, beat_times=beat_times,
-                mel_db=mel_db, onset=onset, frame_times=frame_times,
-                n_frames=n_frames, rms=rms, rms_times=rms_times,
-                positions=positions, step_ms=step_ms, duration_ms=duration_ms)
+                feat_full=feat_full, onset=onset, frame_times=frame_times,
+                rms=rms_raw, rms_times=rms_times, n_frames=n_frames,
+                positions=positions, step_ms=step_ms, duration_ms=duration_ms,
+                # raw signals kept for visualization
+                mel_db=mel_db, sc=sc, chroma=chroma)
 
 
 # ─── MODEL ───────────────────────────────────────────────────────────────────
 
 def _build_transformer(feat_dim, diff_levels, diff_emb, d_model, nhead,
                         num_layers, dim_ff, dropout):
-    """Build ManiaTransformer matching the trainer architecture."""
+    """Build ManiaTransformerV3 matching the trainer architecture."""
     import torch
     import torch.nn as nn
     import math
 
     class PositionalEncoding(nn.Module):
-        def __init__(self, d, max_len=4096, drop=0.1):
+        def __init__(self, d, max_len=2048, drop=0.1):
             super().__init__()
             self.drop = nn.Dropout(drop)
             pe   = torch.zeros(max_len, d)
@@ -148,26 +198,60 @@ def _build_transformer(feat_dim, diff_levels, diff_emb, d_model, nhead,
         def forward(self, x):
             return self.drop(x + self.pe[:, :x.size(1)])
 
-    class ManiaTransformer(nn.Module):
+    class PatternConvBlock(nn.Module):
+        def __init__(self, d, drop=0.1):
+            super().__init__()
+            self.convs = nn.ModuleList([
+                nn.Sequential(
+                    nn.Conv1d(d, d, k, padding=k // 2, groups=d),
+                    nn.Conv1d(d, d, 1),
+                    nn.GELU(),
+                )
+                for k in [3, 5, 9]
+            ])
+            self.proj = nn.Linear(3 * d, d)
+            self.norm = nn.LayerNorm(d)
+            self.drop = nn.Dropout(drop)
+
+        def forward(self, x):
+            h = x.transpose(1, 2)
+            outs = [conv(h).transpose(1, 2) for conv in self.convs]
+            h = torch.cat(outs, dim=-1)
+            return self.norm(x + self.drop(self.proj(h)))
+
+    class ManiaTransformerV3(nn.Module):
         def __init__(self):
             super().__init__()
-            self.diff_emb = nn.Embedding(diff_levels, diff_emb)
-            self.proj     = nn.Linear(feat_dim + diff_emb, d_model)
-            self.pos_enc  = PositionalEncoding(d_model, drop=dropout)
-            enc_layer     = nn.TransformerEncoderLayer(
-                d_model=d_model, nhead=nhead, dim_feedforward=dim_ff,
-                dropout=dropout, batch_first=True)
-            self.encoder  = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-            self.head     = nn.Linear(d_model, 4)
+            self.diff_emb   = nn.Embedding(diff_levels, diff_emb)
+            self.input_proj = nn.Linear(feat_dim + diff_emb, d_model)
+            self.conv_block = PatternConvBlock(d_model, drop=dropout)
+            self.pos_enc    = PositionalEncoding(d_model, drop=dropout)
+            enc_layer       = nn.TransformerEncoderLayer(
+                d_model, nhead, dim_feedforward=dim_ff,
+                dropout=dropout, batch_first=True, norm_first=True)
+            self.transformer = nn.TransformerEncoder(enc_layer, num_layers)
+            self.norm        = nn.LayerNorm(d_model)
+            self.heads       = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(d_model, d_model // 2),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(d_model // 2, 4),
+                )
+                for _ in range(diff_levels)
+            ])
 
         def forward(self, x, diff):
-            # x: (B, T, feat_dim)   diff: (B,)
-            d = self.diff_emb(diff).unsqueeze(1).expand(-1, x.size(1), -1)
-            x = torch.cat([x, d], dim=-1)
-            x = self.pos_enc(self.proj(x))
-            return self.head(self.encoder(x))
+            B, T, _ = x.shape
+            d = self.diff_emb(diff).unsqueeze(1).expand(B, T, -1)
+            h = self.input_proj(torch.cat([x, d], dim=-1))
+            h = self.conv_block(h)
+            h = self.pos_enc(h)
+            h = self.transformer(h)
+            h = self.norm(h)
+            return [head(h) for head in self.heads]   # list of (B, T, 4)
 
-    return ManiaTransformer()
+    return ManiaTransformerV3()
 
 
 def load_nn_model(model_path):
@@ -188,9 +272,9 @@ def load_nn_model(model_path):
         dim_ff      = ckpt.get("dim_ff",      1024)
         dropout     = ckpt.get("dropout",     0.1)
 
-        model_type  = ckpt.get("model_type", "ManiaTransformer")
-        if model_type != "ManiaTransformer":
-            print(f"   [warn] Unexpected model_type '{model_type}' — trying as Transformer")
+        model_type  = ckpt.get("model_type", "ManiaTransformerV3")
+        if "V3" not in model_type:
+            print(f"   [warn] Checkpoint type '{model_type}' — retrain with ManiaNNTrainer.py for best results")
 
         m = _build_transformer(feat_dim, diff_levels, diff_emb,
                                d_model, nhead, num_layers, dim_ff, dropout)
@@ -203,7 +287,7 @@ def load_nn_model(model_path):
 
 # ─── NOTE GENERATION ─────────────────────────────────────────────────────────
 
-def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard"):
+def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord=2):
     try:
         import torch
     except ImportError:
@@ -214,60 +298,247 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard"):
     model.to(device)
     model.eval()
 
-    positions   = audio_data["positions"]
-    beat_length = audio_data["beat_length"]
-    mel_db      = audio_data["mel_db"]
-    onset       = audio_data["onset"]
-    frame_times = audio_data["frame_times"]
-    n_frames    = audio_data["n_frames"]
-
-    diff_idx = DIFF_IDX.get(difficulty, 2)
-
-    def feat_at(t_ms):
-        idx = min(int(np.searchsorted(frame_times, t_ms)), n_frames - 1)
-        f   = np.zeros(_NN_FEAT_DIM, dtype=np.float32)
-        f[:_NN_N_MEL]    = mel_db[:, idx]
-        f[_NN_N_MEL]     = onset[idx]
-        phase             = (t_ms % (beat_length * 4)) / (beat_length * 4 + 1e-9)
-        f[_NN_N_MEL + 1] = float(np.sin(2 * np.pi * phase))
-        f[_NN_N_MEL + 2] = float(np.cos(2 * np.pi * phase))
-        return f
+    positions = audio_data["positions"]
+    feat_full = audio_data["feat_full"]       # (T, 124) — pre-computed in analyze_audio
+    diff_idx  = DIFF_IDX.get(difficulty, 2)
 
     if not positions:
-        return []
+        return [], {"all_prob": np.zeros((0, 4)), "positions": [], "threshold": 0.5}
 
-    features = np.stack([feat_at(t) for t in positions])  # (T, 83)
-
-    # chunked forward pass to handle long songs
-    CHUNK, OVERLAP = 512, 64
-    T       = len(positions)
+    T        = len(positions)
     all_prob = np.zeros((T, KEYS), dtype=np.float32)
     diff_t   = torch.tensor([diff_idx], dtype=torch.long).to(device)
+    CHUNK, OVERLAP = 512, 64
 
     with torch.no_grad():
         i = 0
         while i < T:
-            j    = min(i + CHUNK, T)
-            x    = torch.tensor(features[i:j], dtype=torch.float32).unsqueeze(0).to(device)
-            d    = diff_t.expand(x.size(0))
-            logits = model(x, d)                      # (1, chunk, 4)
-            all_prob[i:j] = torch.sigmoid(logits)[0].cpu().numpy()
+            j = min(i + CHUNK, T)
+            x = torch.tensor(feat_full[i:j], dtype=torch.float32).unsqueeze(0).to(device)
+            d = diff_t.expand(x.size(0))
+            all_heads = model(x, d)            # list of 4 tensors (1, chunk, 4)
+            all_prob[i:j] = torch.sigmoid(all_heads[diff_idx])[0].cpu().numpy()
             i = j - OVERLAP if j < T else T
 
     # threshold from fill% — no max(0.20,...) floor
     threshold = float(np.percentile(all_prob, (1.0 - fill) * 100))
 
-    # time-ordered placement (prevents col_busy check being fooled by sort-by-prob)
-    col_last = {c: -9999.0 for c in range(KEYS)}
-    placed   = []
+    # time-ordered placement with per-step chord cap + column balance weighting
+    col_last   = {c: -9999.0 for c in range(KEYS)}
+    col_counts = [0] * KEYS
+    placed     = []
+
     for i, t in enumerate(positions):
+        total_placed = sum(col_counts) + 1
+        avg_per_col  = total_placed / KEYS
+        eligible = []
         for col in range(KEYS):
             p = float(all_prob[i, col])
             if p >= threshold and t - col_last[col] >= MIN_GAP_MS:
-                placed.append((round(t), col, False, 0))
-                col_last[col] = t
+                # boost underrepresented columns, penalise overrepresented ones
+                bal = avg_per_col / max(col_counts[col], 1)
+                bal = min(max(bal, 0.25), 4.0)   # clamp to avoid extremes
+                eligible.append((p * bal, col))
+        eligible.sort(reverse=True)
+        for _, col in eligible[:max_chord]:
+            placed.append((round(t), col, False, 0))
+            col_last[col]   = t
+            col_counts[col] += 1
 
-    return placed
+    return placed, {"all_prob": all_prob, "positions": positions, "threshold": threshold}
+
+
+# ─── ANALYSIS / VISUALIZATION ────────────────────────────────────────────────
+
+def save_analysis(notes, analysis, audio_data, settings, output_dir):
+    """Save full analysis PNG (song vs map side-by-side) + stats JSON."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.gridspec as gridspec
+        import json as _json
+    except ImportError:
+        print("   [info] pip install matplotlib for map analysis charts"); return
+
+    all_prob  = analysis["all_prob"]
+    positions = analysis["positions"]
+    threshold = analysis["threshold"]
+    duration  = audio_data["duration_ms"] / 1000
+    bpm       = audio_data["bpm_orig"]
+    pos_sec   = [t / 1000 for t in positions]
+
+    COL_COLORS = ["#4caf82", "#4aa8d4", "#f0a030", "#ff66ab"]
+    COL_NAMES  = ["← C1", "← C2", "← C3", "← C4"]
+    BG, SURF   = "#0e0b1a", "#130e22"
+    frame_sec  = audio_data["frame_times"] / 1000
+
+    # ── figure layout ─────────────────────────────────────────────────────────
+    # Left column: song signals  |  Right column: map signals
+    fig = plt.figure(figsize=(26, 14), facecolor=BG)
+    # 7 rows: onset/RMS | chroma | 4 col probs | note roll | NPS density
+    outer = gridspec.GridSpec(1, 2, figure=fig, wspace=0.06,
+                              left=0.04, right=0.98, top=0.93, bottom=0.06)
+    gs_l  = gridspec.GridSpecFromSubplotSpec(4, 1, subplot_spec=outer[0], hspace=0.05,
+                                             height_ratios=[1, 1.5, 0.6, 0.6])
+    gs_r  = gridspec.GridSpecFromSubplotSpec(6, 1, subplot_spec=outer[1], hspace=0.05,
+                                             height_ratios=[1, 1, 1, 1, 1.2, 1])
+
+    def _ax(spec, hide_x=True):
+        ax = fig.add_subplot(spec)
+        ax.set_facecolor(SURF)
+        ax.tick_params(colors="#9d8cbb", labelsize=7)
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#3a2d62")
+        if hide_x:
+            ax.set_xticklabels([])
+        ax.set_xlim(0, duration)
+        return ax
+
+    # ════════════════════════ LEFT: SONG SIGNALS ═══════════════════════════════
+
+    # Row 0 — Onset strength + RMS energy
+    ax_ons = _ax(gs_l[0])
+    onset_raw = audio_data["onset"]
+    ax_ons.fill_between(frame_sec[:len(onset_raw)], onset_raw,
+                        alpha=0.55, color="#ff66ab")
+    ax_ons.plot(frame_sec[:len(onset_raw)], onset_raw,
+                color="#ff66ab", linewidth=0.5)
+    rms_raw = audio_data["rms"]
+    rms_norm = (rms_raw - rms_raw.min()) / (rms_raw.max() - rms_raw.min() + 1e-9)
+    rms_t = audio_data["rms_times"] / 1000
+    ax_ons.plot(rms_t[:len(rms_norm)], rms_norm * onset_raw.max(),
+                color="#c084fc", linewidth=0.8, alpha=0.7, label="RMS (scaled)")
+    ax_ons.set_ylabel("Onset / RMS", color="#9d8cbb", fontsize=8)
+    ax_ons.set_title("SONG SIGNALS", color="#9d8cbb", fontsize=9, loc="left", pad=4)
+
+    # Row 1 — Chroma heatmap (harmonic content)
+    ax_chr = _ax(gs_l[1])
+    chroma = audio_data["chroma"]           # (12, T_frames)
+    note_names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+    im = ax_chr.imshow(chroma, aspect="auto", origin="lower",
+                       extent=[0, duration, -0.5, 11.5],
+                       cmap="magma", vmin=-2, vmax=2, interpolation="nearest")
+    ax_chr.set_yticks(range(12))
+    ax_chr.set_yticklabels(note_names, color="#9d8cbb", fontsize=6)
+    ax_chr.set_ylabel("Chroma", color="#9d8cbb", fontsize=8)
+
+    # Row 2 — Spectral contrast (texture)
+    ax_sc = _ax(gs_l[2])
+    sc = audio_data["sc"]                   # (7, T_frames)
+    sc_mean = sc.mean(axis=0)
+    ax_sc.fill_between(frame_sec[:len(sc_mean)], sc_mean,
+                       alpha=0.5, color="#4aa8d4")
+    ax_sc.plot(frame_sec[:len(sc_mean)], sc_mean, color="#4aa8d4", linewidth=0.5)
+    ax_sc.set_ylabel("Spec. Contrast", color="#9d8cbb", fontsize=8)
+
+    # Row 3 — Beat grid markers
+    ax_bt = _ax(gs_l[3], hide_x=False)
+    for bt in audio_data["beat_times"] / 1000:
+        if 0 <= bt <= duration:
+            ax_bt.axvline(bt, color="#6450a4", linewidth=0.4, alpha=0.7)
+    ax_bt.set_ylabel("Beats", color="#9d8cbb", fontsize=8)
+    ax_bt.set_xlabel("Time (s)", color="#9d8cbb", fontsize=9)
+
+    # ════════════════════════ RIGHT: MAP SIGNALS ═══════════════════════════════
+
+    # Rows 0-3 — Per-column probability traces
+    for col in range(4):
+        ax = _ax(gs_r[col])
+        p  = all_prob[:, col] if len(all_prob) else []
+        if len(p):
+            ax.fill_between(pos_sec, p, alpha=0.45, color=COL_COLORS[col])
+            ax.plot(pos_sec, p, color=COL_COLORS[col], linewidth=0.6, alpha=0.9)
+            ax.axhline(threshold, color="white", linewidth=0.7,
+                       linestyle="--", alpha=0.45)
+        ax.set_ylim(0, 1)
+        ax.set_ylabel(COL_NAMES[col], color=COL_COLORS[col],
+                      fontsize=8, rotation=0, labelpad=28, va="center")
+        if col == 0:
+            ax.set_title("MAP SIGNALS", color="#9d8cbb", fontsize=9, loc="left", pad=4)
+
+    # Row 4 — Note piano-roll
+    ax_n = _ax(gs_r[4])
+    if notes:
+        nt = [n[0] / 1000 for n in notes]
+        nc = [n[1]         for n in notes]
+        ax_n.scatter(nt, nc, c=[COL_COLORS[c] for c in nc],
+                     s=4, alpha=0.9, marker="|", linewidths=1.5)
+    ax_n.set_ylim(-0.5, 3.5)
+    ax_n.set_yticks([0, 1, 2, 3])
+    ax_n.set_yticklabels(["C1", "C2", "C3", "C4"], color="#9d8cbb", fontsize=7)
+    ax_n.set_ylabel("Notes", color="#9d8cbb", fontsize=8)
+
+    # Row 5 — NPS density over time
+    ax_d = _ax(gs_r[5], hide_x=False)
+    if notes and duration > 0:
+        bin_w   = 1.0
+        bins    = int(duration / bin_w) + 1
+        density = [0.0] * bins
+        col_den = [[0.0] * bins for _ in range(4)]
+        for t_ms, c, *_ in notes:
+            b = int(t_ms / 1000 / bin_w)
+            if b < bins:
+                density[b] += 1
+                col_den[c][b] += 1
+        bc = [b * bin_w + bin_w / 2 for b in range(bins)]
+        ax_d.fill_between(bc, density, alpha=0.55, color="#c084fc")
+        ax_d.plot(bc, density, color="#c084fc", linewidth=0.7)
+        for col in range(4):
+            ax_d.fill_between(bc, col_den[col], alpha=0.22, color=COL_COLORS[col])
+        avg_nps = len(notes) / duration
+        ax_d.axhline(avg_nps, color="white", linewidth=0.7, linestyle="--", alpha=0.5)
+        ax_d.text(duration * 0.01, avg_nps * 1.06, f"avg {avg_nps:.1f} NPS",
+                  color="white", fontsize=7, alpha=0.7)
+    ax_d.set_ylim(bottom=0)
+    ax_d.set_ylabel("NPS", color="#9d8cbb", fontsize=8)
+    ax_d.set_xlabel("Time (s)", color="#9d8cbb", fontsize=9)
+
+    # ── stats ─────────────────────────────────────────────────────────────────
+    chord_dist = {}
+    step_notes = {}
+    for t, c, _, _ in notes:
+        step_notes.setdefault(round(t), []).append(c)
+    for cols in step_notes.values():
+        n = len(cols)
+        chord_dist[n] = chord_dist.get(n, 0) + 1
+
+    col_counts = [0, 0, 0, 0]
+    for _, c, _, _ in notes:
+        col_counts[c] += 1
+
+    nps     = len(notes) / duration if duration > 0 else 0
+    cd_str  = "  ".join(f"{k}-note:{v}" for k, v in sorted(chord_dist.items()))
+    bal_str = "  ".join(f"C{i+1}:{col_counts[i]}" for i in range(4))
+
+    title = (f"{settings['title']}  ·  {settings['difficulty']}  ·  "
+             f"{len(notes)} notes  ·  {nps:.1f} NPS  ·  {bpm:.1f} BPM\n"
+             f"chords: {cd_str}    columns: {bal_str}")
+    fig.suptitle(title, color="#ff66ab", fontsize=9, y=0.98)
+
+    safe = "".join(c for c in settings["title"] if c.isalnum() or c in " -_")
+    png_path  = os.path.join(output_dir, f"{safe}_{settings['difficulty']}_analysis.png")
+    json_path = os.path.join(output_dir, f"{safe}_{settings['difficulty']}_analysis.json")
+
+    plt.savefig(png_path, dpi=150, bbox_inches="tight", facecolor=BG)
+    plt.close()
+
+    total_notes  = len(notes)
+    col_pct      = {f"col{i+1}_pct": round(col_counts[i] / max(total_notes, 1) * 100, 1) for i in range(4)}
+    stats = {
+        "title": settings["title"], "artist": settings["artist"],
+        "difficulty": settings["difficulty"], "bpm": round(bpm, 1),
+        "duration_s": round(duration, 1), "total_notes": total_notes,
+        "notes_per_second": round(nps, 2), "threshold_used": round(float(threshold), 4),
+        "chord_distribution": chord_dist,
+        "column_balance": {f"col{i+1}": col_counts[i] for i in range(4)},
+        "column_balance_pct": col_pct,
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        _json.dump(stats, f, indent=2)
+
+    print(f"   Analysis PNG  → {png_path}")
+    print(f"   Analysis JSON → {json_path}")
 
 
 # ─── SV ──────────────────────────────────────────────────────────────────────
@@ -497,15 +768,34 @@ class ManiaMapperGUI:
                  fg=self.MUTE, bg=self.BG).pack()
 
     def _build_card(self):
-        # 1-px glow border via outer frame
-        border = tk.Frame(self.root, bg=self.BD_LT)
-        border.pack(fill="both", expand=True,
-                    padx=self.CARD_MX, pady=(16, 18))
+        # Rounded card via Canvas + PIL
+        card_cv = tk.Canvas(self.root, bg=self.BG, bd=0, highlightthickness=0)
+        card_cv.pack(fill="both", expand=True, padx=self.CARD_MX, pady=(16, 18))
 
-        inner = tk.Frame(border, bg=self.SURF,
-                         padx=self.CARD_PX, pady=24)
-        inner.pack(fill="both", expand=True,
-                   padx=self.CARD_BD, pady=self.CARD_BD)
+        inner = tk.Frame(card_cv, bg=self.SURF, padx=self.CARD_PX, pady=24)
+        inner_win = card_cv.create_window(1, 1, anchor="nw", window=inner)
+
+        def _redraw_card(evt):
+            from PIL import Image, ImageDraw, ImageTk
+            w, h = evt.width, evt.height
+            if w < 4 or h < 4:
+                return
+            scale, r = 2, 18
+            img = Image.new("RGB", (w * scale, h * scale), _hex_to_rgb(self.BG))
+            drw = ImageDraw.Draw(img)
+            drw.rounded_rectangle([0, 0, w*scale-1, h*scale-1],
+                                  radius=r*scale, fill=_hex_to_rgb(self.BD_LT))
+            drw.rounded_rectangle([scale, scale, w*scale-scale-1, h*scale-scale-1],
+                                  radius=(r-1)*scale, fill=_hex_to_rgb(self.SURF))
+            resample = getattr(getattr(Image, "Resampling", None), "LANCZOS", None) or Image.LANCZOS
+            img = img.resize((w, h), resample)
+            card_cv._bg = ImageTk.PhotoImage(img)
+            card_cv.delete("card_bg")
+            card_cv.create_image(0, 0, anchor="nw", image=card_cv._bg, tags="card_bg")
+            card_cv.tag_lower("card_bg")
+            card_cv.itemconfig(inner_win, width=w - 2, height=h - 2)
+
+        card_cv.bind("<Configure>", _redraw_card)
 
         # glass shimmer at top
         tk.Frame(inner, bg="#2e2550", height=1).pack(fill="x", pady=(0, 20))
@@ -525,6 +815,86 @@ class ManiaMapperGUI:
         self._make_gen_btn(inner)
         self._make_progress(inner)
 
+    # ── rounded widget helpers ─────────────────────────────────────────────────
+
+    def _rounded_entry(self, parent, var, radius=10, height=38):
+        """Canvas with PIL rounded background containing an Entry widget."""
+        from PIL import Image, ImageDraw, ImageTk
+        c = tk.Canvas(parent, bg=self.SURF, bd=0, highlightthickness=0, height=height)
+        e = tk.Entry(c, textvariable=var,
+                     font=("Segoe UI", 11), fg=self.TEXT, bg=self.INP,
+                     relief="flat", bd=0,
+                     insertbackground=self.PINK,
+                     selectbackground=self.BD_LT,
+                     selectforeground=self.TEXT)
+        win_id = [None]
+        focused = [False]
+
+        def _draw(f=False):
+            w, h = c.winfo_width(), c.winfo_height()
+            if w < 4:
+                return
+            scale = 2
+            img = Image.new("RGB", (w * scale, h * scale), _hex_to_rgb(self.SURF))
+            drw = ImageDraw.Draw(img)
+            bd_col = _hex_to_rgb(self.PINK if f else self.BD)
+            drw.rounded_rectangle([0, 0, w*scale-1, h*scale-1],
+                                  radius=radius*scale,
+                                  fill=_hex_to_rgb(self.INP),
+                                  outline=bd_col, width=scale)
+            resample = getattr(getattr(Image, "Resampling", None), "LANCZOS", None) or Image.LANCZOS
+            img = img.resize((w, h), resample)
+            c._bg = ImageTk.PhotoImage(img)
+            c.delete("bg")
+            c.create_image(0, 0, anchor="nw", image=c._bg, tags="bg")
+            c.tag_lower("bg")
+            ey = max(0, (h - 24) // 2)
+            if win_id[0] is None:
+                win_id[0] = c.create_window(12, ey, anchor="nw", window=e, width=w - 24, height=24)
+            else:
+                c.coords(win_id[0], 12, ey)
+                c.itemconfig(win_id[0], width=w - 24, height=24)
+
+        e.bind("<FocusIn>",   lambda _: (focused.__setitem__(0, True),  _draw(True)))
+        e.bind("<FocusOut>",  lambda _: (focused.__setitem__(0, False), _draw(False)))
+        c.bind("<Configure>", lambda _: _draw(focused[0]))
+        return c
+
+    def _rounded_label_canvas(self, parent, var, radius=10, height=38):
+        """Canvas with PIL rounded background containing a read-only Label."""
+        from PIL import Image, ImageDraw, ImageTk
+        c = tk.Canvas(parent, bg=self.SURF, bd=0, highlightthickness=0, height=height)
+        lbl = tk.Label(c, textvariable=var,
+                       font=("Segoe UI", 10), fg=self.DIM, bg=self.INP, anchor="w")
+        win_id = [None]
+
+        def _draw():
+            w, h = c.winfo_width(), c.winfo_height()
+            if w < 4:
+                return
+            scale = 2
+            img = Image.new("RGB", (w * scale, h * scale), _hex_to_rgb(self.SURF))
+            drw = ImageDraw.Draw(img)
+            drw.rounded_rectangle([0, 0, w*scale-1, h*scale-1],
+                                  radius=radius*scale,
+                                  fill=_hex_to_rgb(self.INP),
+                                  outline=_hex_to_rgb(self.BD), width=scale)
+            resample = getattr(getattr(Image, "Resampling", None), "LANCZOS", None) or Image.LANCZOS
+            img = img.resize((w, h), resample)
+            c._bg = ImageTk.PhotoImage(img)
+            c.delete("bg")
+            c.create_image(0, 0, anchor="nw", image=c._bg, tags="bg")
+            c.tag_lower("bg")
+            ly = max(0, (h - 20) // 2)
+            if win_id[0] is None:
+                win_id[0] = c.create_window(12, ly, anchor="nw", window=lbl, width=w - 24)
+            else:
+                c.coords(win_id[0], 12, ly)
+                c.itemconfig(win_id[0], width=w - 24)
+
+        c.bind("<Configure>", lambda _: _draw())
+        return c
+
     # ── row builders ──────────────────────────────────────────────────────────
 
     def _lbl(self, parent, text):
@@ -542,41 +912,25 @@ class ManiaMapperGUI:
         inner = tk.Frame(row, bg=self.SURF)
         inner.pack(side="left", fill="x", expand=True)
 
-        name_bg = tk.Frame(inner, bg=self.INP,
-                           highlightthickness=1, highlightbackground=self.BD)
-        name_bg.pack(side="left", fill="x", expand=True, ipady=7, padx=(0, 10))
-        tk.Label(name_bg, textvariable=self._audio_var,
-                 font=("Segoe UI", 10), fg=self.DIM, bg=self.INP,
-                 anchor="w", padx=12).pack(fill="x")
+        name_cv = self._rounded_label_canvas(inner, self._audio_var)
+        name_cv.pack(side="left", fill="x", expand=True, padx=(0, 10))
 
-        browse = tk.Button(inner, text="Browse",
-                           command=self._browse,
-                           font=("Segoe UI", 10, "bold"),
-                           fg=self.PINK, bg=self.SURF2,
-                           activeforeground=self.PINK_LT,
-                           activebackground=self.BD,
-                           relief="flat", cursor="hand2",
-                           padx=14, pady=6)
-        browse.pack(side="right")
+        bw, bh = 82, 36
+        br_n = _pill_photo(bw, bh, "Browse", self.SURF2, self.SURF, fg_hex=self.PINK,     font_size=10)
+        br_h = _pill_photo(bw, bh, "Browse", self.BD,    self.SURF, fg_hex=self.PINK_LT,  font_size=10)
+        br_lbl = tk.Label(inner, image=br_n, bg=self.SURF, cursor="hand2", bd=0)
+        br_lbl.pack(side="right")
+        br_lbl._imgs = (br_n, br_h)
+        br_lbl.bind("<Enter>",    lambda _: br_lbl.config(image=br_h))
+        br_lbl.bind("<Leave>",    lambda _: br_lbl.config(image=br_n))
+        br_lbl.bind("<Button-1>", lambda _: self._browse())
 
     def _make_entry_row(self, parent, label, var):
         row = tk.Frame(parent, bg=self.SURF)
         row.pack(fill="x", pady=(0, 14))
         self._lbl(row, label)
-
-        frame = tk.Frame(row, bg=self.INP,
-                         highlightthickness=1, highlightbackground=self.BD)
-        frame.pack(side="left", fill="x", expand=True)
-
-        e = tk.Entry(frame, textvariable=var,
-                     font=("Segoe UI", 11), fg=self.TEXT,
-                     bg=self.INP, relief="flat", bd=0,
-                     insertbackground=self.PINK,
-                     selectbackground=self.BD_LT,
-                     selectforeground=self.TEXT)
-        e.pack(fill="x", padx=12, ipady=8)
-        e.bind("<FocusIn>",  lambda _: frame.config(highlightbackground=self.PINK))
-        e.bind("<FocusOut>", lambda _: frame.config(highlightbackground=self.BD))
+        c = self._rounded_entry(row, var)
+        c.pack(side="left", fill="x", expand=True)
 
     def _make_diff_row(self, parent):
         row = tk.Frame(parent, bg=self.SURF)
@@ -796,20 +1150,21 @@ class ManiaMapperGUI:
             audio = analyze_audio(settings["audio_path"])
 
             upd(55, "Running Transformer — generating notes…")
-            d     = DIFFICULTY_PRESETS[settings["difficulty"]]
-            notes = generate_notes(audio, nn, fill=d["fill"], difficulty=settings["difficulty"])
+            d               = DIFFICULTY_PRESETS[settings["difficulty"]]
+            notes, analysis = generate_notes(audio, nn, fill=d["fill"],
+                                             difficulty=settings["difficulty"],
+                                             max_chord=d["max_chord"])
 
             upd(78, "Generating SV…" if settings["sv"] else "Finalising…")
             sv = generate_sv_points(audio) if settings["sv"] else []
 
             upd(90, "Packaging .osz…")
-            safe_t = "".join(c for c in settings["title"]  if c.isalnum() or c in " -_")
-            safe_a = "".join(c for c in settings["artist"] if c.isalnum() or c in " -_")
-            out    = os.path.join(
-                os.path.dirname(os.path.abspath(settings["audio_path"])),
-                f"{safe_a} - {safe_t} [{settings['difficulty']}].osz"
-            )
-            count = build_osz(settings, audio, notes, sv, out)
+            safe_t   = "".join(c for c in settings["title"]  if c.isalnum() or c in " -_")
+            safe_a   = "".join(c for c in settings["artist"] if c.isalnum() or c in " -_")
+            out_dir  = os.path.dirname(os.path.abspath(settings["audio_path"]))
+            out      = os.path.join(out_dir, f"{safe_a} - {safe_t} [{settings['difficulty']}].osz")
+            count    = build_osz(settings, audio, notes, sv, out)
+            save_analysis(notes, analysis, audio, settings, out_dir)
             upd(100, f"Done!  {count} notes  ·  {audio['bpm_orig']:.1f} BPM")
             self._q.put(("done", count, out, audio["bpm_orig"]))
         except Exception as exc:
@@ -849,8 +1204,8 @@ class ManiaMapperGUI:
 
         self._open_btn = tk.Button(
             self._prog_outer,
-            text="Open folder  ↗",
-            command=lambda: os.startfile(os.path.dirname(out_path)),
+            text="Open .osz  ↗",
+            command=lambda: os.startfile(out_path),
             font=("Segoe UI", 10, "bold"),
             fg=self.PINK, bg=self.SURF,
             relief="flat", cursor="hand2",
@@ -939,21 +1294,24 @@ def main():
     audio_data = analyze_audio(args.audio)
 
     print("[2/3] Generating notes...")
-    d     = DIFFICULTY_PRESETS[settings["difficulty"]]
-    notes = generate_notes(audio_data, nn_model, fill=d["fill"], difficulty=settings["difficulty"])
+    d               = DIFFICULTY_PRESETS[settings["difficulty"]]
+    notes, analysis = generate_notes(audio_data, nn_model, fill=d["fill"],
+                                     difficulty=settings["difficulty"],
+                                     max_chord=d["max_chord"])
     print(f"   {len(notes)} notes  |  fill: top {int(d['fill']*100)}%")
 
     sv_points = generate_sv_points(audio_data) if settings["sv"] else []
 
     safe_title  = "".join(c for c in settings["title"]  if c.isalnum() or c in " -_")
     safe_artist = "".join(c for c in settings["artist"] if c.isalnum() or c in " -_")
+    out_dir     = os.path.dirname(os.path.abspath(args.audio))
     output_path = args.output or os.path.join(
-        os.path.dirname(os.path.abspath(args.audio)),
-        f"{safe_artist} - {safe_title} [{settings['difficulty']}].osz"
+        out_dir, f"{safe_artist} - {safe_title} [{settings['difficulty']}].osz"
     )
 
     print("[3/3] Building .osz...")
     count = build_osz(settings, audio_data, notes, sv_points, output_path)
+    save_analysis(notes, analysis, audio_data, settings, out_dir)
     print(f"\n  Done!  {count} notes  |  BPM: {audio_data['bpm_orig']:.1f}")
     print(f"  Output: {output_path}")
     print(f"\n  Double-click the .osz to import into osu!")
