@@ -2,10 +2,20 @@
 ManiaMapper.py
 Generates a 4K osu!mania beatmap from an audio file.
 
+Two-stage generation:
+  Stage 1 — Segment Classifier: splits the audio into sections and uses the
+             model's style_head to decide what pattern type each section
+             sounds like. The model determines how many sections and where
+             boundaries fall, based on its training.
+  Stage 2 — Style-Conditioned Generation: runs the LSTM per segment with the
+             classified style_id embedded, then applies style-specific
+             parameter modulation (chord density, LN rate, spacing) per position.
+             Style params are blended smoothly at boundaries for seamless feel.
+
 Usage:
     python ManiaMapper.py song.mp3
     python ManiaMapper.py song.mp3 --output my_map.osu
-    python ManiaMapper.py song.mp3 --model mania_model.json
+    python ManiaMapper.py song.mp3 --nn mania_style_model.pt
 """
 
 import os, sys, random, argparse, zipfile, json
@@ -16,17 +26,52 @@ import numpy as np
 KEYS  = 4
 COL_X = [64, 192, 320, 448]   # x-positions for columns 0-3 in 4K
 
-# breathe=1.5: blocks same-column AA (1 step) but allows cross-hand ABAB trills (2 steps).
-# Same-hand ABA (0→1→0) is caught by hand-aware filtering in note selection.
 DIFFICULTY_PRESETS = {
-    #  keep         = fraction of onset-aligned slots that get a note (0=nothing, 1=all beats)
-    #  chord_scale  = multiplier on Markov chord rate — keep low for flowing single notes
-    #  breathe      = per-column cooldown multiplier — higher = more gap between same-col hits
     "Easy":   {"hp": 6, "od": 6,  "subdiv": 2, "keep": 0.40, "chord": 0.05, "ln": 0.20, "chord_scale": 0.25, "breathe": 2.0, "triplets": False},
     "Normal": {"hp": 7, "od": 7,  "subdiv": 4, "keep": 0.55, "chord": 0.08, "ln": 0.15, "chord_scale": 0.40, "breathe": 1.5, "triplets": False},
     "Hard":   {"hp": 8, "od": 8,  "subdiv": 8, "keep": 0.70, "chord": 0.12, "ln": 0.10, "chord_scale": 0.55, "breathe": 1.2, "triplets": True},
-    "Insane": {"hp": 9, "od": 9,  "subdiv": 8, "keep": 1.0, "chord": 0.30, "ln": 0.05, "chord_scale": 1.00, "breathe": 2.0, "triplets": True},
+    "Insane": {"hp": 9, "od": 9,  "subdiv": 8, "keep": 1.0,  "chord": 0.30, "ln": 0.05, "chord_scale": 1.00, "breathe": 2.0, "triplets": True},
 }
+
+# ─── STYLE DEFINITIONS ────────────────────────────────────────────────────────
+
+STYLE_CLASSES = [
+    "tech",
+    "streams",
+    "complex_streams",
+    "jump_streams",
+    "hand_streams",
+    "ln",
+    "complex_ln",
+    "ranked_allround",
+    "chord_jacks",
+    "chord_jacks_doubles",
+]
+
+# How each style modulates base generation parameters per segment.
+#   chord_mult  : multiplier on chord probability
+#   ln_mult     : multiplier on LN probability
+#   breathe_mult: multiplier on column cooldown (higher = more spacing)
+#   keep_mult   : multiplier on note density
+STYLE_PATTERN_PARAMS = {
+    "tech":                {"chord_mult": 1.2,  "ln_mult": 0.7,   "breathe_mult": 1.0,  "keep_mult": 0.9},
+    "streams":             {"chord_mult": 0.2,  "ln_mult": 0.05,  "breathe_mult": 0.7,  "keep_mult": 1.3},
+    "complex_streams":     {"chord_mult": 0.4,  "ln_mult": 0.05,  "breathe_mult": 0.7,  "keep_mult": 1.2},
+    "jump_streams":        {"chord_mult": 0.7,  "ln_mult": 0.05,  "breathe_mult": 0.8,  "keep_mult": 1.2},
+    "hand_streams":        {"chord_mult": 1.0,  "ln_mult": 0.05,  "breathe_mult": 0.8,  "keep_mult": 1.1},
+    "ln":                  {"chord_mult": 0.3,  "ln_mult": 3.5,   "breathe_mult": 1.6,  "keep_mult": 0.7},
+    "complex_ln":          {"chord_mult": 0.5,  "ln_mult": 2.5,   "breathe_mult": 1.4,  "keep_mult": 0.8},
+    "ranked_allround":     {"chord_mult": 1.0,  "ln_mult": 1.0,   "breathe_mult": 1.0,  "keep_mult": 1.0},
+    "chord_jacks":         {"chord_mult": 2.5,  "ln_mult": 0.05,  "breathe_mult": 0.55, "keep_mult": 1.0},
+    "chord_jacks_doubles": {"chord_mult": 3.5,  "ln_mult": 0.05,  "breathe_mult": 0.45, "keep_mult": 1.0},
+}
+_DEFAULT_STYLE_PARAMS = {"chord_mult": 1.0, "ln_mult": 1.0, "breathe_mult": 1.0, "keep_mult": 1.0}
+
+# Segment classifier settings — the model decides how many segments
+_CLASSIFY_WIN_BEATS  = 4    # beats per classification window (rolling)
+_CLASSIFY_STRIDE     = 2    # stride between windows in beats
+_MIN_SEG_BEATS       = 8    # short segments below this are merged into neighbours
+_TRANSITION_FACTOR   = 2    # style params blend over this many beats at boundaries
 
 # Hand layout: left = cols 0,1 / right = cols 2,3
 _LEFT  = frozenset({0, 1})
@@ -34,6 +79,7 @@ _RIGHT = frozenset({2, 3})
 
 def _same_hand(c1: int, c2: int) -> bool:
     return (c1 in _LEFT and c2 in _LEFT) or (c1 in _RIGHT and c2 in _RIGHT)
+
 
 # ─── INTERACTIVE PROMPTS ──────────────────────────────────────────────────────
 
@@ -96,7 +142,7 @@ def analyze_audio(audio_path):
         print("ERROR: librosa not installed. Run: pip install librosa")
         sys.exit(1)
 
-    print("[1/3] Analysing audio...")
+    print("[1/4] Analysing audio...")
     y, sr = librosa.load(audio_path, sr=None)
 
     tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
@@ -106,12 +152,10 @@ def analyze_audio(audio_path):
                                               hop_length=512, backtrack=True)
     onset_times = librosa.frames_to_time(onset_frames, sr=sr) * 1000
 
-    # Full RMS (overall energy)
     hop = 512
     rms       = librosa.feature.rms(y=y, hop_length=hop)[0]
     rms_times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop) * 1000
 
-    # Spectral bands + MFCC — used for both Markov band-aware mapping and LSTM inference
     S     = np.abs(librosa.stft(y, hop_length=hop))
     freqs = librosa.fft_frequencies(sr=sr)
     def _norm(x):
@@ -122,12 +166,11 @@ def analyze_audio(audio_path):
     mid_norm  = _norm(S[(freqs >= 300) & (freqs < 3000), :].mean(axis=0))
     high_norm = _norm(S[freqs >= 3000, :].mean(axis=0))
 
-    # MFCC — needed by the LSTM model
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20, hop_length=hop)
     mfcc = (mfcc - mfcc.mean(axis=1, keepdims=True)) / (mfcc.std(axis=1, keepdims=True) + 1e-9)
 
     bpm_orig    = float(np.atleast_1d(tempo)[0])
-    bpm         = bpm_orig * 2          # doubled for finer Markov/rule-based grid
+    bpm         = bpm_orig * 2
     beat_length = 60000.0 / bpm
     duration_ms = len(y) / sr * 1000
 
@@ -146,12 +189,6 @@ def analyze_audio(audio_path):
 # ─── BEAT GRID ───────────────────────────────────────────────────────────────
 
 def build_beat_grid(audio_data, subdiv, triplets=False):
-    """
-    Generate timing grid snapped to beat subdivisions.
-    subdiv=2 -> 8th notes, 4 -> 16th, 8 -> 32nd.
-    triplets=True also inserts 1/3-beat and 2/3-beat slots for off-beat triplet patterns.
-    Returns list of (time_ms, strength), deduped and sorted.
-    """
     beat_times  = audio_data["beat_times"]
     beat_length = audio_data["beat_length"]
     onset_times = audio_data["onset_times"]
@@ -174,7 +211,6 @@ def build_beat_grid(audio_data, subdiv, triplets=False):
         t_next      = beat_times[i + 1] if i + 1 < len(beat_times) else t_beat + beat_length
         actual_step = (t_next - t_beat) / subdiv
 
-        # Standard subdivision slots
         for s in range(subdiv):
             t = t_beat + s * actual_step
             if s == 0:
@@ -187,7 +223,6 @@ def build_beat_grid(audio_data, subdiv, triplets=False):
                 strength = 0.20
             add_slot(t, strength)
 
-        # Triplet slots: 1/3 and 2/3 of the beat interval
         if triplets:
             beat_interval = t_next - t_beat
             add_slot(t_beat + beat_interval / 3.0, 0.18)
@@ -205,10 +240,6 @@ def load_model(model_path: str) -> dict:
 
 
 def sample_weighted(counts: dict, allowed: list = None):
-    """
-    Sample a key from counts dict weighted by count values.
-    Restricts to keys whose int value is in allowed if provided.
-    """
     if not counts:
         return None
     filtered = {}
@@ -230,10 +261,6 @@ def sample_weighted(counts: dict, allowed: list = None):
 
 
 def sample_chord_combo(chord_combos: dict, free_cols: list):
-    """
-    Sample a Markov-weighted 2-col chord restricted to free_cols.
-    Returns a sorted 2-list or None if nothing fits.
-    """
     filtered = {}
     for combo_str, count in chord_combos.items():
         c1, c2 = map(int, combo_str.split(","))
@@ -254,39 +281,57 @@ def sample_chord_combo(chord_combos: dict, free_cols: list):
     return [c1, c2]
 
 
-# ─── LSTM INFERENCE (mania_nn_model.pt) ──────────────────────────────────────
+# ─── LSTM MODEL LOADING ───────────────────────────────────────────────────────
 
 _NN_N_MFCC   = 20
 _NN_FEAT_DIM = _NN_N_MFCC + 5
-_NN_SUBDIV   = 4   # training subdivision
+_NN_SUBDIV   = 4
 
 
 def load_nn_model(model_path: str):
-    """Load the trained LSTM from ManiaNNTrainer.py."""
+    """
+    Load the full ManiaStyleLSTM trained by ManiaNNTrainer.py.
+    Both note_head (placement) and style_head (segment classification) are loaded.
+    """
     try:
         import torch
+        import torch.nn as nn
     except ImportError:
         return None
 
     try:
-        import torch.nn as nn
         ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
 
-        class ManiaLSTM(nn.Module):
-            def __init__(self, feat_dim, hidden_dim, num_layers):
-                super().__init__()
-                self.lstm = nn.LSTM(feat_dim, hidden_dim, num_layers, batch_first=True, dropout=0.3)
-                self.norm = nn.LayerNorm(hidden_dim)
-                self.fc   = nn.Linear(hidden_dim, 4)
-            def forward(self, x):
-                out, _ = self.lstm(x)
-                return self.fc(self.norm(out))
+        num_styles = len(ckpt.get("style_classes", STYLE_CLASSES))
+        feat_dim   = ckpt.get("feat_dim",   _NN_FEAT_DIM)
+        hidden_dim = ckpt.get("hidden_dim", 256)
+        num_layers = ckpt.get("num_layers", 3)
+        style_dim  = ckpt.get("style_dim",  16)
 
-        model = ManiaLSTM(
-            feat_dim   = ckpt.get("feat_dim",   _NN_FEAT_DIM),
-            hidden_dim = ckpt.get("hidden_dim", 256),
-            num_layers = ckpt.get("num_layers", 3),
-        )
+        class ManiaStyleLSTM(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.style_embed = nn.Embedding(num_styles, style_dim)
+                self.lstm        = nn.LSTM(feat_dim + style_dim, hidden_dim, num_layers,
+                                           batch_first=True, dropout=0.3)
+                self.norm        = nn.LayerNorm(hidden_dim)
+                self.note_head   = nn.Linear(hidden_dim, 4)
+                self.style_head  = nn.Linear(hidden_dim, num_styles)
+
+            def forward(self, x, style_ids):
+                """
+                x          : (B, T, feat_dim)
+                style_ids  : (B,) — style index; use 0 for pure audio-driven classification
+                Returns note_logits (B,T,4) and style_logits (B, num_styles)
+                """
+                emb    = self.style_embed(style_ids)
+                emb_t  = emb.unsqueeze(1).expand(-1, x.size(1), -1)
+                inp    = torch.cat([x, emb_t], dim=-1)
+                out, _ = self.lstm(inp)
+                out    = self.norm(out)
+                return self.note_head(out), self.style_head(out.mean(dim=1))
+
+        model = ManiaStyleLSTM()
         model.load_state_dict(ckpt["model_state"])
         model.eval()
         return {"model": model, "meta": ckpt}
@@ -295,13 +340,198 @@ def load_nn_model(model_path: str):
         return None
 
 
-def assign_columns_nn(audio_data, nn_model_data, keep, ln_chance, chord_chance=0.15, breathe=1.8):
-    """
-    LSTM-based note generation.
+# ─── STAGE 1: MODEL-DRIVEN SEGMENT CLASSIFICATION ────────────────────────────
 
-    The trained model sees beat-aligned MFCC + spectral features and outputs
-    per-column probabilities at each 16th-note position.
-    Threshold + anti-pattern filters (breathe, ABA) are applied post-hoc.
+def segment_and_classify(audio_data, nn_model_data):
+    """
+    Stage 1 — the model decides how many segments and what style each one is.
+
+    Algorithm:
+      1. Run the model's style_head on overlapping _CLASSIFY_WIN_BEATS windows
+         (stride = _CLASSIFY_STRIDE beats) with zero style embedding so the
+         classification is driven purely by audio.
+      2. Accumulate per-beat style probability votes across all windows that
+         cover each beat.
+      3. Smooth per-beat style assignments with a majority-vote filter (±2 beats)
+         to remove single-beat noise.
+      4. Detect boundaries where the smoothed style changes.
+      5. Merge segments shorter than _MIN_SEG_BEATS into their neighbours so
+         the structure stays coherent.
+
+    Returns list of (start_ms, end_ms, style_id, style_name).
+    The number of segments is fully determined by the model's output.
+    """
+    import torch
+
+    model         = nn_model_data["model"]
+    meta          = nn_model_data["meta"]
+    style_classes = meta.get("style_classes", STYLE_CLASSES)
+    n_styles      = len(style_classes)
+
+    beat_times    = audio_data["beat_times"]
+    beat_len_orig = audio_data["beat_length_orig"]
+    beat_len      = audio_data["beat_length"]
+    mfcc          = audio_data["mfcc"]
+    bass_norm     = audio_data["bass_norm"]
+    mid_norm      = audio_data["mid_norm"]
+    high_norm     = audio_data["high_norm"]
+    rms_times     = audio_data["rms_times"]
+    duration      = audio_data["duration_ms"]
+    n_frames      = mfcc.shape[1]
+    step_ms       = beat_len / _NN_SUBDIV
+
+    def _feat_at(t_ms):
+        idx = min(int(np.searchsorted(rms_times, t_ms)), n_frames - 1)
+        f   = np.zeros(_NN_FEAT_DIM, dtype=np.float32)
+        f[:_NN_N_MFCC]    = mfcc[:, idx]
+        f[_NN_N_MFCC]     = bass_norm[idx]
+        f[_NN_N_MFCC + 1] = mid_norm[idx]
+        f[_NN_N_MFCC + 2] = high_norm[idx]
+        phase              = (t_ms % (beat_len_orig * 4)) / (beat_len_orig * 4 + 1e-9)
+        f[_NN_N_MFCC + 3] = float(np.sin(2 * np.pi * phase))
+        f[_NN_N_MFCC + 4] = float(np.cos(2 * np.pi * phase))
+        return f
+
+    device    = next(model.parameters()).device
+    num_beats = len(beat_times)
+
+    # Fallback for very short audio
+    if num_beats < _CLASSIFY_WIN_BEATS:
+        default_id   = style_classes.index("ranked_allround") if "ranked_allround" in style_classes else 0
+        default_name = style_classes[default_id]
+        return [(0.0, duration, default_id, default_name)]
+
+    # ── Step 1 & 2: sliding window voting ─────────────────────────────────────
+    beat_votes = np.zeros((num_beats, n_styles), dtype=np.float32)
+
+    for i in range(0, num_beats, _CLASSIFY_STRIDE):
+        win_end_i = min(i + _CLASSIFY_WIN_BEATS, num_beats)
+        win_beats = beat_times[i:win_end_i]
+        seg_end_ms = beat_times[win_end_i] if win_end_i < num_beats else duration
+
+        positions = []
+        for t_beat in win_beats:
+            for s in range(_NN_SUBDIV):
+                t = t_beat + s * step_ms
+                if t >= seg_end_ms:
+                    break
+                positions.append(t)
+
+        if len(positions) < 4:
+            continue
+
+        feats = np.stack([_feat_at(t) for t in positions])
+        X     = torch.tensor(feats, dtype=torch.float32).unsqueeze(0).to(device)
+        dummy = torch.zeros(1, dtype=torch.long, device=device)
+
+        with torch.no_grad():
+            _, style_logits = model(X, dummy)
+            probs = torch.softmax(style_logits[0], dim=0).cpu().numpy()
+
+        for bi in range(i, win_end_i):
+            beat_votes[bi] += probs
+
+    # Per-beat: argmax of accumulated votes
+    beat_style_ids = []
+    for bi in range(num_beats):
+        if beat_votes[bi].sum() > 0:
+            beat_style_ids.append(int(np.argmax(beat_votes[bi])))
+        else:
+            beat_style_ids.append(beat_style_ids[-1] if beat_style_ids else 0)
+
+    # ── Step 3: smooth with majority vote over ±2 beats ───────────────────────
+    smoothed = []
+    for i in range(num_beats):
+        window = beat_style_ids[max(0, i - 2): i + 3]
+        counts = {}
+        for s in window:
+            counts[s] = counts.get(s, 0) + 1
+        smoothed.append(max(counts, key=counts.get))
+
+    # ── Step 4: detect boundaries ─────────────────────────────────────────────
+    raw_segs = []
+    cur_style = smoothed[0]
+    cur_start = 0
+    for i in range(1, num_beats):
+        if smoothed[i] != cur_style:
+            raw_segs.append((cur_start, i, cur_style))
+            cur_style = smoothed[i]
+            cur_start = i
+    raw_segs.append((cur_start, num_beats, cur_style))
+
+    # ── Step 5: merge short segments into neighbours ──────────────────────────
+    merged = []
+    for bi_start, bi_end, style_id in raw_segs:
+        length = bi_end - bi_start
+        if merged and length < _MIN_SEG_BEATS:
+            prev = merged[-1]
+            merged[-1] = (prev[0], bi_end, prev[2])   # extend previous, keep its style
+        else:
+            merged.append((bi_start, bi_end, style_id))
+
+    # Convert beat indices → ms and build final result
+    result = []
+    for bi_start, bi_end, style_id in merged:
+        start_ms   = float(beat_times[bi_start])
+        end_ms     = float(beat_times[bi_end]) if bi_end < num_beats else duration
+        style_name = style_classes[style_id] if style_id < n_styles else "ranked_allround"
+        result.append((start_ms, end_ms, style_id, style_name))
+
+    return result
+
+
+def _style_params_at(t_ms, segment_map, beat_length_orig):
+    """
+    Return style generation parameters for time t_ms.
+
+    Within _TRANSITION_FACTOR beats of a segment boundary, parameters are
+    linearly interpolated between the two adjacent segments so the map
+    transitions smoothly rather than snapping abruptly.
+    """
+    if not segment_map:
+        return _DEFAULT_STYLE_PARAMS
+
+    transition_ms = beat_length_orig * _TRANSITION_FACTOR
+
+    for k, (start_ms, end_ms, _, style_name) in enumerate(segment_map):
+        if start_ms <= t_ms < end_ms:
+            cur_p = STYLE_PATTERN_PARAMS.get(style_name, _DEFAULT_STYLE_PARAMS)
+
+            # Blend with previous segment near the start boundary
+            dist_start = t_ms - start_ms
+            if k > 0 and dist_start < transition_ms:
+                alpha   = dist_start / transition_ms          # 0 → 1
+                prev_p  = STYLE_PATTERN_PARAMS.get(segment_map[k - 1][3], _DEFAULT_STYLE_PARAMS)
+                return {key: prev_p[key] * (1.0 - alpha) + cur_p[key] * alpha
+                        for key in cur_p}
+
+            # Blend with next segment near the end boundary
+            dist_end = end_ms - t_ms
+            if k < len(segment_map) - 1 and dist_end < transition_ms:
+                alpha   = dist_end / transition_ms            # 1 → 0
+                next_p  = STYLE_PATTERN_PARAMS.get(segment_map[k + 1][3], _DEFAULT_STYLE_PARAMS)
+                return {key: cur_p[key] * alpha + next_p[key] * (1.0 - alpha)
+                        for key in cur_p}
+
+            return cur_p
+
+    # Past the last segment end
+    return STYLE_PATTERN_PARAMS.get(segment_map[-1][3], _DEFAULT_STYLE_PARAMS)
+
+
+# ─── STAGE 2: STYLE-CONDITIONED NOTE GENERATION ──────────────────────────────
+
+def assign_columns_nn(audio_data, nn_model_data, keep, ln_chance, chord_chance=0.15,
+                      breathe=1.8, segment_map=None):
+    """
+    Stage 2 — style-conditioned note generation.
+
+    For each segment from Stage 1:
+      - Runs the LSTM forward pass with that segment's style_id embedded so
+        the note_head generates probabilities appropriate for that pattern type.
+      - Per-position style params (chord density, LN rate, breathe, density)
+        are fetched from _style_params_at, which interpolates at boundaries
+        for seamless transitions.
     """
     try:
         import torch
@@ -312,38 +542,37 @@ def assign_columns_nn(audio_data, nn_model_data, keep, ln_chance, chord_chance=0
     device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    beat_times   = audio_data["beat_times"]
-    beat_len_orig= audio_data["beat_length_orig"]   # original BPM beat length
-    beat_len     = audio_data["beat_length"]         # doubled BPM beat length (finer grid)
-    mfcc         = audio_data["mfcc"]               # (20, T_frames)
-    bass_norm    = audio_data["bass_norm"]
-    mid_norm     = audio_data["mid_norm"]
-    high_norm    = audio_data["high_norm"]
-    rms          = audio_data["rms"]
-    rms_times    = audio_data["rms_times"]
-    rms_norm     = (rms - rms.min()) / (rms.max() - rms.min() + 1e-6)
-    duration     = audio_data["duration_ms"]
-    n_frames     = mfcc.shape[1]
-    # Use doubled-BPM step for 2× denser grid (32nd notes at original BPM)
-    step_ms      = beat_len / _NN_SUBDIV
-    min_gap      = 80.0  # hard physical minimum between same-column notes
+    beat_times    = audio_data["beat_times"]
+    beat_len_orig = audio_data["beat_length_orig"]
+    beat_len      = audio_data["beat_length"]
+    mfcc          = audio_data["mfcc"]
+    bass_norm     = audio_data["bass_norm"]
+    mid_norm      = audio_data["mid_norm"]
+    high_norm     = audio_data["high_norm"]
+    rms           = audio_data["rms"]
+    rms_times     = audio_data["rms_times"]
+    rms_norm      = (rms - rms.min()) / (rms.max() - rms.min() + 1e-6)
+    duration      = audio_data["duration_ms"]
+    n_frames      = mfcc.shape[1]
+    step_ms       = beat_len / _NN_SUBDIV
+    min_gap       = 80.0
 
     def _feat_at(t_ms: float) -> np.ndarray:
         idx = min(int(np.searchsorted(rms_times, t_ms)), n_frames - 1)
         f   = np.zeros(_NN_FEAT_DIM, dtype=np.float32)
-        f[:_NN_N_MFCC]        = mfcc[:, idx]
-        f[_NN_N_MFCC]         = bass_norm[idx]
-        f[_NN_N_MFCC + 1]     = mid_norm[idx]
-        f[_NN_N_MFCC + 2]     = high_norm[idx]
-        phase                  = (t_ms % (beat_len_orig * 4)) / (beat_len_orig * 4 + 1e-9)
-        f[_NN_N_MFCC + 3]     = float(np.sin(2 * np.pi * phase))
-        f[_NN_N_MFCC + 4]     = float(np.cos(2 * np.pi * phase))
+        f[:_NN_N_MFCC]    = mfcc[:, idx]
+        f[_NN_N_MFCC]     = bass_norm[idx]
+        f[_NN_N_MFCC + 1] = mid_norm[idx]
+        f[_NN_N_MFCC + 2] = high_norm[idx]
+        phase              = (t_ms % (beat_len_orig * 4)) / (beat_len_orig * 4 + 1e-9)
+        f[_NN_N_MFCC + 3] = float(np.sin(2 * np.pi * phase))
+        f[_NN_N_MFCC + 4] = float(np.cos(2 * np.pi * phase))
         return f
 
-    # Build beat-aligned positions using doubled BPM → 2× more grid slots
+    # Build full position list
     positions = []
     for t_beat in beat_times:
-        for s in range(_NN_SUBDIV * 2):   # *2 to cover doubled BPM subdivisions
+        for s in range(_NN_SUBDIV * 2):
             t = t_beat + s * step_ms
             if t > duration:
                 break
@@ -352,25 +581,58 @@ def assign_columns_nn(audio_data, nn_model_data, keep, ln_chance, chord_chance=0
     if not positions:
         return []
 
-    features = np.stack([_feat_at(t) for t in positions])          # (T, F)
-    X        = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)  # (1, T, F)
+    features = np.stack([_feat_at(t) for t in positions])   # (T, F)
 
-    with torch.no_grad():
-        probs = torch.sigmoid(model(X))[0].cpu().numpy()           # (T, 4)
+    # ── Style-conditioned LSTM forward pass per segment ───────────────────────
+    # Each segment's positions are processed with its own style_id embedded.
+    # This conditions the note_head on the correct pattern type for that section.
+    all_probs = np.zeros((len(positions), 4), dtype=np.float32)
 
-    # Smooth rms_norm over ~300ms window to avoid burst-gap-burst in slow sections
+    if segment_map:
+        for seg_start_ms, seg_end_ms, seg_style_id, _ in segment_map:
+            seg_idx = [i for i, t in enumerate(positions)
+                       if seg_start_ms <= t < seg_end_ms]
+            if not seg_idx:
+                continue
+            seg_feats = np.stack([features[i] for i in seg_idx])
+            X_seg = torch.tensor(seg_feats, dtype=torch.float32).unsqueeze(0).to(device)
+            sid   = torch.tensor([seg_style_id], dtype=torch.long, device=device)
+            with torch.no_grad():
+                note_logits, _ = model(X_seg, sid)
+                seg_probs = torch.sigmoid(note_logits[0]).cpu().numpy()
+            for local_i, global_i in enumerate(seg_idx):
+                all_probs[global_i] = seg_probs[local_i]
+
+        # Fallback for any uncovered positions (e.g. past last segment end)
+        uncovered = [i for i, t in enumerate(positions)
+                     if not any(s <= t < e for s, e, _, _ in segment_map)]
+        if uncovered:
+            unc_feats = np.stack([features[i] for i in uncovered])
+            X_unc = torch.tensor(unc_feats, dtype=torch.float32).unsqueeze(0).to(device)
+            dummy = torch.zeros(1, dtype=torch.long, device=device)
+            with torch.no_grad():
+                note_logits, _ = model(X_unc, dummy)
+                unc_probs = torch.sigmoid(note_logits[0]).cpu().numpy()
+            for local_i, global_i in enumerate(uncovered):
+                all_probs[global_i] = unc_probs[local_i]
+    else:
+        X     = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)
+        dummy = torch.zeros(1, dtype=torch.long, device=device)
+        with torch.no_grad():
+            note_logits, _ = model(X, dummy)
+            all_probs = torch.sigmoid(note_logits[0]).cpu().numpy()
+
+    # Smooth rms over ~300ms window
     win = max(1, int(300.0 / ((rms_times[1] - rms_times[0]) if len(rms_times) > 1 else 1.0)))
     kernel       = np.ones(win) / win
     rms_smooth   = np.convolve(rms, kernel, mode='same')
     rsm_s_min, rsm_s_max = rms_smooth.min(), rms_smooth.max()
     rms_smooth_n = (rms_smooth - rsm_s_min) / (rsm_s_max - rsm_s_min + 1e-9)
 
-    rms_norm_arr     = rms_norm                                   # instant energy (for LN/chord)
-    trill_energy_thr = float(np.percentile(rms_norm_arr, 70))    # top 30% triggers trill
+    rms_norm_arr     = rms_norm
+    trill_energy_thr = float(np.percentile(rms_norm_arr, 70))
 
-    # Precompute bass peak times — local maxima above 70th percentile in bass_norm
-    # These are kick/bass drum hits that must always trigger a note
-    bass_hit_thr   = float(np.percentile(bass_norm, 70))
+    bass_hit_thr    = float(np.percentile(bass_norm, 70))
     bass_peak_times = []
     for k in range(1, len(bass_norm) - 1):
         if (bass_norm[k] > bass_hit_thr
@@ -379,19 +641,18 @@ def assign_columns_nn(audio_data, nn_model_data, keep, ln_chance, chord_chance=0
             bass_peak_times.append(float(rms_times[k]))
     bass_peak_arr = np.array(bass_peak_times) if bass_peak_times else np.array([])
 
-    # All repeating trill patterns — each entry is a cycle of column sets
     TRILL_PATTERNS = [
-        ([0,1], [2,3]),          # 0: chord trill L→R→L→R
-        ([2,3], [0,1]),          # 1: chord trill R→L→R→L (same but opposite phase start)
-        ([0,3], [1,2]),          # 2: outer/inner chord trill
-        ([0], [1], [2], [3]),    # 3: staircase up  0→1→2→3
-        ([3], [2], [1], [0]),    # 4: staircase down 3→2→1→0
-        ([0], [1], [2], [3], [2], [1]),  # 5: staircase up-down pingpong
-        ([0], [2], [0], [2]),    # 6: cross-hand ping-pong (col 0 & 2)
-        ([1], [3], [1], [3]),    # 7: cross-hand ping-pong (col 1 & 3)
-        ([0], [1], [0], [1]),    # 8: fast left-hand trill
-        ([2], [3], [2], [3]),    # 9: fast right-hand trill
-        ([0], [2], [1], [3]),    # 10: zigzag across columns
+        ([0,1], [2,3]),
+        ([2,3], [0,1]),
+        ([0,3], [1,2]),
+        ([0], [1], [2], [3]),
+        ([3], [2], [1], [0]),
+        ([0], [1], [2], [3], [2], [1]),
+        ([0], [2], [0], [2]),
+        ([1], [3], [1], [3]),
+        ([0], [1], [0], [1]),
+        ([2], [3], [2], [3]),
+        ([0], [2], [1], [3]),
     ]
 
     notes           = []
@@ -402,17 +663,19 @@ def assign_columns_nn(audio_data, nn_model_data, keep, ln_chance, chord_chance=0
     trill_type      = 0
     trill_stair_pos = 0
     trill_remaining = 0
-    last_kick_t     = -9999.0   # time of last detected kick
-    kick_streak     = 0         # consecutive kick count
-    jack_cols       = None      # chord columns used in active chord jack
+    last_kick_t     = -9999.0
+    kick_streak     = 0
+    jack_cols       = None
 
     for i, t in enumerate(positions):
         idx         = min(int(np.searchsorted(rms_times, t)), len(rms_norm_arr) - 1)
-        energy      = float(rms_norm_arr[idx])          # instant — for LN / chord / trill
-        energy_s    = float(rms_smooth_n[idx])          # smoothed — for density decisions
-        bass_energy = float(bass_norm[idx])             # bass hit strength
+        energy      = float(rms_norm_arr[idx])
+        energy_s    = float(rms_smooth_n[idx])
+        bass_energy = float(bass_norm[idx])
 
-        # ── Song-position ramp ────────────────────────────────────────────
+        # Fetch blended style params for this exact position
+        sp = _style_params_at(t, segment_map, beat_len_orig)
+
         song_progress = t / max(duration, 1.0)
         if song_progress < 0.12:
             intro_scale = song_progress / 0.12
@@ -421,17 +684,15 @@ def assign_columns_nn(audio_data, nn_model_data, keep, ln_chance, chord_chance=0
         else:
             intro_scale = 1.0
 
-        # Check if this position falls on a bass hit (within half a step)
         on_bass_hit = (len(bass_peak_arr) > 0
                        and float(np.min(np.abs(bass_peak_arr - t))) < step_ms * 0.6)
 
-        # Bass hits in slow/medium sections always fire; others use smoothed energy gate
+        local_keep = keep * sp["keep_mult"] * (0.35 + 0.65 * energy_s) * intro_scale
         if not (on_bass_hit and energy_s < 0.70):
-            local_keep = keep * (0.35 + 0.65 * energy_s) * intro_scale
             if random.random() > local_keep:
                 continue
 
-        # ── Trill zone detection ───────────────────────────────────────────
+        # ── Trill zone ────────────────────────────────────────────────────
         if not trill_active and energy > trill_energy_thr:
             future_high = sum(
                 1 for j in range(i, min(i + 12, len(positions)))
@@ -454,7 +715,7 @@ def assign_columns_nn(audio_data, nn_model_data, keep, ln_chance, chord_chance=0
             trill_stair_pos += 1
 
             free = [c for c in step if col_busy.get(c, 0) <= t]
-            if len(free) == len(step):   # all columns in this step are free
+            if len(free) == len(step):
                 for col in step:
                     col_busy[col] = t + min_gap
                     notes.append((round(t), col, False, 0))
@@ -462,7 +723,7 @@ def assign_columns_nn(audio_data, nn_model_data, keep, ln_chance, chord_chance=0
                 continue
 
         # ── Normal note placement ──────────────────────────────────────────
-        col_probs = probs[i]
+        col_probs = all_probs[i]
 
         def col_score(c):
             if c == last_col:
@@ -472,45 +733,34 @@ def assign_columns_nn(audio_data, nn_model_data, keep, ln_chance, chord_chance=0
                 dist = abs(c - last_col)
                 if dist == 1:   score += 0.40
                 elif dist == 2: score += 0.10
-            # Soft penalty for returning to prev_col — discourages A→B→A back-and-forths
-            # but doesn't hard-block them (still possible when other cols are busy)
             if c == prev_col:
                 score -= 0.28
-            # Bass hits feel natural on outer columns (0, 3) like a kick drum
             if on_bass_hit and c in (0, 3):
                 score += 0.35
             return score
 
         ranked = sorted(range(KEYS), key=col_score, reverse=True)
-
-        best = None
-        for c in ranked:
-            if col_busy.get(c, 0) <= t:
-                best = c
-                break
+        best   = next((c for c in ranked if col_busy.get(c, 0) <= t), None)
         if best is None:
             continue
 
         chosen = [best]
 
-        # ── Chord — boosted on hard bass hits ─────────────────────────────
-        # bass_energy > 0.6 = identifiable kick → higher chord probability
-        effective_chord = min(0.95, chord_chance + bass_energy * 0.35)
+        # ── Chord — style-modulated ────────────────────────────────────────
+        effective_chord = min(0.95, chord_chance * sp["chord_mult"] + bass_energy * 0.35)
         if random.random() < effective_chord:
             free_cols = [c for c in range(KEYS) if c != best and col_busy.get(c, 0) <= t]
             if free_cols:
                 second = max(free_cols, key=lambda c: col_probs[c])
                 chosen.append(second)
-
-                # Triple chord — scales with energy
-                triple_prob = chord_chance * (0.4 + 0.6 * energy)
+                triple_prob = chord_chance * sp["chord_mult"] * (0.4 + 0.6 * energy)
                 if random.random() < triple_prob:
                     free_cols2 = [c for c in range(KEYS)
                                   if c not in chosen and col_busy.get(c, 0) <= t]
                     if free_cols2:
                         chosen.append(max(free_cols2, key=lambda c: col_probs[c]))
 
-        # ── Chord jack on consecutive hard kicks ──────────────────────────
+        # ── Chord jack on consecutive kicks ───────────────────────────────
         in_chord_jack = False
         if on_bass_hit:
             if t - last_kick_t < beat_len_orig * 1.8:
@@ -521,10 +771,9 @@ def assign_columns_nn(audio_data, nn_model_data, keep, ln_chance, chord_chance=0
 
             if kick_streak >= 2:
                 in_chord_jack = True
-                # Force at least a 2-col chord; reuse jack_cols if still valid
                 free_all = [c for c in range(KEYS) if col_busy.get(c, 0) <= t]
                 if jack_cols and all(c in free_all for c in jack_cols):
-                    chosen = list(jack_cols)   # repeat same chord = jack feel
+                    chosen = list(jack_cols)
                 elif len(free_all) >= 2:
                     chosen = sorted(random.sample(free_all, 2))
                     jack_cols = tuple(chosen)
@@ -541,39 +790,39 @@ def assign_columns_nn(audio_data, nn_model_data, keep, ln_chance, chord_chance=0
         prev_col = last_col
         last_col = chosen[0] if len(chosen) == 1 else -1
 
-        # ── LN logic ──────────────────────────────────────────────────────
-        # No LNs during chord jacks — player needs clean hits on every kick
+        local_breathe = breathe * sp["breathe_mult"]
+
+        # ── LN — style-modulated ──────────────────────────────────────────
         if in_chord_jack:
             for col in chosen:
-                col_busy[col] = t + min_gap * breathe
+                col_busy[col] = t + min_gap * local_breathe
                 notes.append((round(t), col, False, 0))
             continue
 
+        local_ln = ln_chance * sp["ln_mult"]
+
         if energy < 0.35:
-            # Slow: mix of long (45%), short (30%), plain tap (25%)
             r = random.random()
             if r < 0.45:
-                ln_prob  = min(0.90, ln_chance * 8.0)
+                ln_prob  = min(0.90, local_ln * 8.0)
                 ln_beats = random.uniform(1.5, 3.5)
             elif r < 0.75:
-                ln_prob  = min(0.75, ln_chance * 5.0)
+                ln_prob  = min(0.75, local_ln * 5.0)
                 ln_beats = random.uniform(0.3, 0.9)
             else:
-                ln_prob  = 0.0          # plain single tap / chord
+                ln_prob  = 0.0
                 ln_beats = 0.0
         elif energy < 0.65:
-            ln_prob  = min(0.80, ln_chance * 2.5)
+            ln_prob  = min(0.80, local_ln * 2.5)
             ln_beats = random.uniform(0.6, 1.5)
         else:
-            # Fast: short LNs common, long LNs rare (10%)
             if random.random() < 0.10:
-                ln_prob  = min(0.35, ln_chance * 1.5)
+                ln_prob  = min(0.35, local_ln * 1.5)
                 ln_beats = random.uniform(1.0, 2.0)
             else:
-                ln_prob  = min(0.60, ln_chance * 2.5)
+                ln_prob  = min(0.60, local_ln * 2.5)
                 ln_beats = random.uniform(0.15, 0.45)
 
-        # Two simultaneous LNs — rare (8% of chord placements in slow/mid)
         double_ln = (len(chosen) == 2 and energy < 0.65 and random.random() < 0.08)
 
         for col_idx, col in enumerate(chosen):
@@ -584,7 +833,7 @@ def assign_columns_nn(audio_data, nn_model_data, keep, ln_chance, chord_chance=0
                 col_busy[col] = ln_end + min_gap
                 notes.append((round(t), col, True, ln_end))
             else:
-                col_busy[col] = t + min_gap * breathe
+                col_busy[col] = t + min_gap * local_breathe
                 notes.append((round(t), col, False, 0))
 
     return notes
@@ -593,23 +842,6 @@ def assign_columns_nn(audio_data, nn_model_data, keep, ln_chance, chord_chance=0
 # ─── ML COLUMN ASSIGNMENT ─────────────────────────────────────────────────────
 
 def assign_columns_ml(audio_data, model, subdiv, keep, ln_chance, chord_chance, breathe=1.5):
-    """
-    Onset-driven, band-aware column assignment using the Markov model.
-
-    Timing:
-      - Primary candidates = detected audio onsets (actual musical events)
-      - Secondary fill     = beat downbeats in high-energy sections with no nearby onset
-      - Global 80ms dedup prevents visual stacking
-
-    Band awareness:
-      - Bass-heavy onset (kick) → prefer chord or outer columns (0, 3)
-      - High-frequency onset (hi-hat) → prefer inner columns (1, 2)
-      - Mid/balanced onset → Markov-weighted column selection
-
-    Anti-pattern rules:
-      - breathe cooldown per column blocks same-column repeats
-      - Hand-aware ABA filter: same-hand ABA blocked, cross-hand trill allowed
-    """
     beat_length = audio_data["beat_length"]
     beat_times  = audio_data["beat_times"]
     onset_arr   = sorted(audio_data["onset_times"])
@@ -625,10 +857,7 @@ def assign_columns_ml(audio_data, model, subdiv, keep, ln_chance, chord_chance, 
         idx = min(int(np.searchsorted(rms_times, t)), len(arr) - 1)
         return float(arr[idx])
 
-    # ── Step 1: collect candidate note times ──────────────────────────────
     candidates = set()
-
-    # A) Onset-driven: every detected onset, gated by energy
     for t in onset_arr:
         if t > duration:
             break
@@ -636,7 +865,6 @@ def assign_columns_ml(audio_data, model, subdiv, keep, ln_chance, chord_chance, 
         if random.random() < keep * (0.35 + e * 0.85):
             candidates.add(round(t))
 
-    # B) Beat fill: strong downbeats not already covered by a nearby onset
     onset_set = set(round(t) for t in onset_arr)
     for t_beat in beat_times:
         e = _at(rms_norm, t_beat)
@@ -645,8 +873,7 @@ def assign_columns_ml(audio_data, model, subdiv, keep, ln_chance, chord_chance, 
             if not any(abs(t_r - o) < 50 for o in onset_set):
                 candidates.add(t_r)
 
-    # Sort and enforce global 80ms minimum gap
-    raw_times = sorted(candidates)
+    raw_times    = sorted(candidates)
     active_times = []
     last_t = -9999
     for t in raw_times:
@@ -654,7 +881,6 @@ def assign_columns_ml(audio_data, model, subdiv, keep, ln_chance, chord_chance, 
             active_times.append(t)
             last_t = t
 
-    # ── Step 2: assign columns ─────────────────────────────────────────────
     s2s        = model.get("single_to_single", {})
     c2s        = model.get("chord_to_single", {})
     combo_pool = model.get("chord_combos", {})
@@ -674,14 +900,11 @@ def assign_columns_ml(audio_data, model, subdiv, keep, ln_chance, chord_chance, 
         bass   = _at(bass_norm, t)
         high   = _at(high_norm, t)
 
-        # Bass-heavy hit → bonus chord probability (accent the kick drum)
         bass_bonus      = bass * chord_chance * 0.6
         effective_chord = min(0.85, chord_chance * (0.2 + energy * 0.8) + bass_bonus)
 
-        # ── Double chord (2 notes, bass-aware column preference) ───────────
         if random.random() < effective_chord and len(free_cols) >= 2:
             if bass > 0.55 and len([c for c in free_cols if c in (0, 3)]) >= 1:
-                # Kick: pair one outer + one inner column for a strong feel
                 outer = [c for c in free_cols if c in (0, 3)]
                 inner = [c for c in free_cols if c in (1, 2)]
                 if outer and inner:
@@ -694,8 +917,6 @@ def assign_columns_ml(audio_data, model, subdiv, keep, ln_chance, chord_chance, 
                 chosen = pair if pair else sorted(random.sample(free_cols, 2))
             last_single = -1
             prev_single = -1
-
-        # ── Single note (Markov + hand-aware + band preference) ────────────
         else:
             if last_cols:
                 if len(last_cols) == 1:
@@ -717,7 +938,6 @@ def assign_columns_ml(audio_data, model, subdiv, keep, ln_chance, chord_chance, 
             else:
                 candidates_col = no_double
 
-            # Hi-hat / high-freq hit → prefer inner columns (1, 2)
             if high > bass * 1.4 and high > 0.45:
                 inner = [c for c in candidates_col if c in (1, 2)]
                 if inner:
@@ -733,7 +953,6 @@ def assign_columns_ml(audio_data, model, subdiv, keep, ln_chance, chord_chance, 
             prev_single = last_single
             last_single = col
 
-        # LN: quiet passages → more long notes
         local_ln = min(0.90, ln_chance * (2.0 - energy * 1.5))
 
         for col in chosen:
@@ -757,13 +976,9 @@ def assign_columns_ml(audio_data, model, subdiv, keep, ln_chance, chord_chance, 
     return notes
 
 
-# ─── RULE-BASED COLUMN ASSIGNMENT (fallback when no model) ───────────────────
+# ─── RULE-BASED COLUMN ASSIGNMENT (fallback) ─────────────────────────────────
 
 def assign_columns(audio_data, subdiv, keep, chord_chance, ln_chance, breathe=1.5, triplets=False):
-    """
-    Rule-based fallback. Same anti-pattern rules as assign_columns_ml:
-    breathe cooldown + hand-aware same-hand-ABA filtering.
-    """
     beat_length = audio_data["beat_length"]
     grid        = build_beat_grid(audio_data, subdiv, triplets=triplets)
     min_gap     = max(beat_length / subdiv * 0.85, 90.0)
@@ -780,7 +995,7 @@ def assign_columns(audio_data, subdiv, keep, chord_chance, ln_chance, breathe=1.
             raw_times.append(t)
     raw_times.sort()
 
-    active_times = []
+    active_times  = []
     last_accepted = -9999
     for t in raw_times:
         if t - last_accepted >= 80:
@@ -803,13 +1018,10 @@ def assign_columns(audio_data, subdiv, keep, chord_chance, ln_chance, breathe=1.
 
         effective_chord = chord_chance * (0.25 + energy * 0.75)
 
-        # ── Double chord ────────────────────────────────────────────────────
         if random.random() < effective_chord and len(free_cols) >= 2:
             chosen = sorted(random.sample(free_cols, 2))
             last_single = -1
             prev_single = -1
-
-        # ── Single note (round-robin + hand-aware filtering) ────────────────
         else:
             no_double = [c for c in free_cols if c != last_single] if last_single >= 0 else list(free_cols)
             if not no_double:
@@ -878,7 +1090,6 @@ def generate_sv_points(audio_data):
 
 def write_osu(settings, audio_data, notes, sv_points, output_path):
     d           = DIFFICULTY_PRESETS[settings["difficulty"]]
-    bpm         = audio_data["bpm"]
     beat_length = audio_data["beat_length"]
     offset      = 0
     audio_file  = os.path.basename(settings["audio_path"])
@@ -964,7 +1175,7 @@ def main():
     parser = argparse.ArgumentParser(description="4K osu!mania map generator")
     parser.add_argument("audio",    help="Audio file (mp3, ogg, wav, flac)")
     parser.add_argument("--output", "-o", help="Output .osz path")
-    parser.add_argument("--nn",           help="Path to mania_nn_model.pt (LSTM)")
+    parser.add_argument("--nn",           help="Path to mania_style_model.pt (LSTM)")
     args = parser.parse_args()
 
     if not os.path.isfile(args.audio):
@@ -972,7 +1183,7 @@ def main():
         sys.exit(1)
 
     scripts_dir   = os.path.dirname(os.path.abspath(__file__))
-    nn_model_path = args.nn or os.path.join(scripts_dir, "mania_nn_model.pt")
+    nn_model_path = args.nn or os.path.join(scripts_dir, "mania_style_model.pt")
 
     if not os.path.isfile(nn_model_path):
         print(f"ERROR: LSTM model not found at {nn_model_path}")
@@ -985,25 +1196,37 @@ def main():
         print("ERROR: Failed to load LSTM model.")
         sys.exit(1)
     m = nn_model["meta"]
-    print(f"  Trained on {m.get('maps_trained','?')} maps  |  LSTM ready")
+    print(f"  Trained on {m.get('maps_trained','?')} maps  |  Styles: {len(m.get('style_classes', STYLE_CLASSES))}")
 
     settings = get_user_settings(args.audio)
     settings["audio_path"] = args.audio
 
     audio_data = analyze_audio(args.audio)
 
-    print("[2/3] Generating notes...")
+    # ── Stage 1: model decides segment boundaries and pattern types ───────
+    print("[2/4] Classifying song structure...")
+    segment_map = segment_and_classify(audio_data, nn_model)
+
+    print(f"   {len(segment_map)} section(s) detected:")
+    for start_ms, end_ms, style_id, style_name in segment_map:
+        duration_s = (end_ms - start_ms) / 1000
+        print(f"   {int(start_ms/1000):4d}s – {int(end_ms/1000):4d}s  ({duration_s:.0f}s)  →  {style_name}")
+
+    # ── Stage 2: style-conditioned note generation ────────────────────────
+    print("[3/4] Generating notes (style-conditioned per section)...")
     d      = DIFFICULTY_PRESETS[settings["difficulty"]]
     chord  = d["chord"] * d["chord_scale"]
     notes  = assign_columns_nn(
-        audio_data   = audio_data,
-        nn_model_data= nn_model,
-        keep         = d["keep"],
-        ln_chance    = d["ln"],
-        chord_chance = chord,
-        breathe      = d["breathe"],
+        audio_data    = audio_data,
+        nn_model_data = nn_model,
+        keep          = d["keep"],
+        ln_chance     = d["ln"],
+        chord_chance  = chord,
+        breathe       = d["breathe"],
+        segment_map   = segment_map,
     )
-    print(f"   [LSTM]  keep: {d['keep']}  |  chord: {chord:.2f}  |  breathe: {d['breathe']}×")
+    print(f"   base keep: {d['keep']}  chord: {chord:.2f}  breathe: {d['breathe']}×")
+    print(f"   (all parameters modulated per section with {_TRANSITION_FACTOR}-beat blended transitions)")
 
     sv_points = []
     if settings["sv"]:
@@ -1022,14 +1245,14 @@ def main():
             f"{safe_artist} - {safe_title} [{settings['difficulty']}].osz"
         )
 
-    print("[3/3] Building .osz...")
+    print("[4/4] Building .osz...")
     count = build_osz(settings, audio_data, notes, sv_points, output_path)
 
     print(f"\n  Done!")
-    print(f"  Notes  : {count}")
-    print(f"  BPM    : {audio_data['bpm']:.1f}")
-    print(f"  Mode   : LSTM")
-    print(f"  Output : {output_path}")
+    print(f"  Notes    : {count}")
+    print(f"  BPM      : {audio_data['bpm']:.1f}")
+    print(f"  Sections : {len(segment_map)}")
+    print(f"  Output   : {output_path}")
     print(f"\n  Double-click the .osz to import directly into osu!")
 
 
