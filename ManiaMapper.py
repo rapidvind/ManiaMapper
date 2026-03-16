@@ -30,9 +30,13 @@ _NN_SUBDIV        = 4          # 16th-note inference grid
 _NN_N_MEL         = 80
 _NN_N_SC          = 7
 _NN_N_CHROMA      = 12
-_NN_FEAT_DIM_AUDIO = _NN_N_MEL + 1 + _NN_N_SC + _NN_N_CHROMA + 1 + 1 + 6  # 108
+# V4 audio features: mel(80)+onset(1)+onset_harm(1)+onset_perc(1)+sc(7)+chroma(12)+
+#                    rms(1)+flat(1)+centroid(1)+zcr(1)+phases_4scales(8) = 114
+_NN_FEAT_DIM_AUDIO = 114
 _NN_FEAT_DIM_CTX  = 16         # zeros at inference (no sibling maps)
-_NN_FEAT_DIM      = _NN_FEAT_DIM_AUDIO + _NN_FEAT_DIM_CTX               # 124
+_NN_FEAT_DIM      = _NN_FEAT_DIM_AUDIO + _NN_FEAT_DIM_CTX               # 130
+_NN_MAX_LN_BEATS  = 16.0       # max LN duration in beats
+_NN_NUM_PATTERNS  = 9
 
 DIFF_IDX = {"Easy": 0, "Normal": 1, "Hard": 2, "Insane": 3}
 
@@ -95,28 +99,47 @@ def analyze_audio(audio_path):
     duration_ms = len(y) / sr * 1000
     hop         = _NN_HOP
 
+    # ── harmonic / percussive separation ──────────────────────────────────────
+    try:
+        y_harm, y_perc = librosa.effects.hpss(y)
+    except Exception:
+        y_harm, y_perc = y, y
+
     # ── mel spectrogram ────────────────────────────────────────────────────────
     mel    = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=_NN_N_MEL, hop_length=hop)
     mel_db = librosa.power_to_db(mel, ref=np.max)
     mel_db = (mel_db - mel_db.mean()) / (mel_db.std() + 1e-9)
 
-    # ── onset strength ─────────────────────────────────────────────────────────
+    n_frames    = mel_db.shape[1]
+    frame_times = librosa.frames_to_time(np.arange(n_frames), sr=sr, hop_length=hop) * 1000
+
+    # ── onset strength (full + harmonic + percussive) ──────────────────────────
     onset = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
     onset = (onset - onset.mean()) / (onset.std() + 1e-9)
+    try:
+        onset_harm = librosa.onset.onset_strength(y=y_harm, sr=sr, hop_length=hop)
+        onset_harm = (onset_harm - onset_harm.mean()) / (onset_harm.std() + 1e-9)
+    except Exception:
+        onset_harm = np.zeros(n_frames, dtype=np.float32)
+    try:
+        onset_perc = librosa.onset.onset_strength(y=y_perc, sr=sr, hop_length=hop)
+        onset_perc = (onset_perc - onset_perc.mean()) / (onset_perc.std() + 1e-9)
+    except Exception:
+        onset_perc = np.zeros(n_frames, dtype=np.float32)
 
     # ── spectral contrast ──────────────────────────────────────────────────────
     try:
         sc = librosa.feature.spectral_contrast(y=y, sr=sr, hop_length=hop)
         sc = (sc - sc.mean(axis=1, keepdims=True)) / (sc.std(axis=1, keepdims=True) + 1e-9)
     except Exception:
-        sc = np.zeros((_NN_N_SC, mel_db.shape[1]), dtype=np.float32)
+        sc = np.zeros((_NN_N_SC, n_frames), dtype=np.float32)
 
     # ── chroma CQT ─────────────────────────────────────────────────────────────
     try:
         chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
         chroma = (chroma - chroma.mean(axis=1, keepdims=True)) / (chroma.std(axis=1, keepdims=True) + 1e-9)
     except Exception:
-        chroma = np.zeros((_NN_N_CHROMA, mel_db.shape[1]), dtype=np.float32)
+        chroma = np.zeros((_NN_N_CHROMA, n_frames), dtype=np.float32)
 
     # ── RMS (also kept for SV) ─────────────────────────────────────────────────
     rms_raw   = librosa.feature.rms(y=y, hop_length=hop)[0]
@@ -128,10 +151,21 @@ def analyze_audio(audio_path):
         flat = librosa.feature.spectral_flatness(y=y, hop_length=hop)[0]
         flat = (flat - flat.mean()) / (flat.std() + 1e-9)
     except Exception:
-        flat = np.zeros(mel_db.shape[1], dtype=np.float32)
+        flat = np.zeros(n_frames, dtype=np.float32)
 
-    n_frames    = mel_db.shape[1]
-    frame_times = librosa.frames_to_time(np.arange(n_frames), sr=sr, hop_length=hop) * 1000
+    # ── spectral centroid ──────────────────────────────────────────────────────
+    try:
+        centroid = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop)[0]
+        centroid = centroid / (sr / 2.0)   # normalize to [0, 1]
+    except Exception:
+        centroid = np.zeros(n_frames, dtype=np.float32)
+
+    # ── zero crossing rate ─────────────────────────────────────────────────────
+    try:
+        zcr = librosa.feature.zero_crossing_rate(y=y, hop_length=hop)[0]
+        zcr = (zcr - zcr.mean()) / (zcr.std() + 1e-9)
+    except Exception:
+        zcr = np.zeros(n_frames, dtype=np.float32)
 
     # ── uniform beat grid (inference at 16th-note resolution) ─────────────────
     beat0_ms  = float(beat_times[0]) if len(beat_times) else 0.0
@@ -142,29 +176,42 @@ def analyze_audio(audio_path):
         positions.append(t)
         t += step_ms
 
-    # ── feature matrix at each grid position ──────────────────────────────────
+    # ── feature matrix at each grid position (114-dim, matching V4 trainer) ───
     def feat_at(t_ms):
         idx = min(int(np.searchsorted(frame_times, t_ms)), n_frames - 1)
         f   = np.zeros(_NN_FEAT_DIM_AUDIO, dtype=np.float32)
-        f[:_NN_N_MEL]                                         = mel_db[:, idx]
-        f[_NN_N_MEL]                                          = onset[idx]
-        f[_NN_N_MEL+1 : _NN_N_MEL+1+_NN_N_SC]               = sc[:, idx]
-        f[_NN_N_MEL+1+_NN_N_SC : _NN_N_MEL+1+_NN_N_SC+_NN_N_CHROMA] = chroma[:, idx]
-        f[_NN_N_MEL+1+_NN_N_SC+_NN_N_CHROMA]                 = rms_feat[idx]
-        f[_NN_N_MEL+1+_NN_N_SC+_NN_N_CHROMA+1]               = flat[idx]
-        for k, scale in enumerate([1, 2, 4]):
+        # mel: 0..79
+        f[:_NN_N_MEL]                        = mel_db[:, idx]
+        # onset: 80, onset_harm: 81, onset_perc: 82
+        f[_NN_N_MEL]                         = onset[idx]
+        f[_NN_N_MEL + 1]                     = onset_harm[idx]
+        f[_NN_N_MEL + 2]                     = onset_perc[idx]
+        # sc: 83..89
+        base_sc = _NN_N_MEL + 3
+        f[base_sc : base_sc + _NN_N_SC]      = sc[:, idx]
+        # chroma: 90..101
+        base_ch = base_sc + _NN_N_SC
+        f[base_ch : base_ch + _NN_N_CHROMA]  = chroma[:, idx]
+        # rms: 102, flat: 103, centroid: 104, zcr: 105
+        base_rms = base_ch + _NN_N_CHROMA
+        f[base_rms]     = rms_feat[idx]
+        f[base_rms + 1] = flat[idx]
+        f[base_rms + 2] = centroid[idx]
+        f[base_rms + 3] = zcr[idx]
+        # phases @ 4 temporal scales (1,2,4,8 beat): 106..113
+        base_ph = base_rms + 4
+        for k, scale in enumerate([1, 2, 4, 8]):
             period = beat_length * scale
             phase  = (t_ms % period) / (period + 1e-9)
-            base   = _NN_N_MEL + 1 + _NN_N_SC + _NN_N_CHROMA + 2 + k * 2
-            f[base]   = float(np.sin(2 * np.pi * phase))
-            f[base+1] = float(np.cos(2 * np.pi * phase))
+            f[base_ph + k * 2]     = float(np.sin(2 * np.pi * phase))
+            f[base_ph + k * 2 + 1] = float(np.cos(2 * np.pi * phase))
         return f
 
-    feat_audio = np.stack([feat_at(t) for t in positions])   # (T, 108)
+    feat_audio = np.stack([feat_at(t) for t in positions])   # (T, 114)
     # Pad with zeros for cross-diff context (no sibling maps at inference)
     feat_full  = np.concatenate(
         [feat_audio, np.zeros((len(positions), _NN_FEAT_DIM_CTX), dtype=np.float32)],
-        axis=1)                                                # (T, 124)
+        axis=1)                                                # (T, 130)
 
     print(f"   BPM: {bpm_orig:.1f}  |  Grid steps: {len(positions)}")
     return dict(bpm_orig=bpm_orig, beat_length=beat_length, beat_times=beat_times,
@@ -178,8 +225,8 @@ def analyze_audio(audio_path):
 # ─── MODEL ───────────────────────────────────────────────────────────────────
 
 def _build_transformer(feat_dim, diff_levels, diff_emb, d_model, nhead,
-                        num_layers, dim_ff, dropout):
-    """Build ManiaTransformerV3 matching the trainer architecture."""
+                        num_layers, dim_ff, dropout, max_ln_beats=16.0, num_patterns=9):
+    """Build ManiaTransformerV4 matching the trainer architecture."""
     import torch
     import torch.nn as nn
     import math
@@ -207,9 +254,9 @@ def _build_transformer(feat_dim, diff_levels, diff_emb, d_model, nhead,
                     nn.Conv1d(d, d, 1),
                     nn.GELU(),
                 )
-                for k in [3, 5, 9]
+                for k in [3, 5, 9, 13]
             ])
-            self.proj = nn.Linear(3 * d, d)
+            self.proj = nn.Linear(4 * d, d)
             self.norm = nn.LayerNorm(d)
             self.drop = nn.Dropout(drop)
 
@@ -219,25 +266,45 @@ def _build_transformer(feat_dim, diff_levels, diff_emb, d_model, nhead,
             h = torch.cat(outs, dim=-1)
             return self.norm(x + self.drop(self.proj(h)))
 
-    class ManiaTransformerV3(nn.Module):
+    class DiffHead(nn.Module):
+        def __init__(self, d_in, drop=0.1):
+            super().__init__()
+            self.shared    = nn.Sequential(
+                nn.Linear(d_in, d_in // 2),
+                nn.GELU(),
+                nn.Dropout(drop),
+            )
+            self.hit_out    = nn.Linear(d_in // 2, 4)
+            self.ln_out     = nn.Linear(d_in // 2, 4)
+            self.ln_dur_out = nn.Linear(d_in // 2, 4)
+
+        def forward(self, h):
+            h2 = self.shared(h)
+            return (
+                self.hit_out(h2),
+                self.ln_out(h2),
+                torch.sigmoid(self.ln_dur_out(h2)) * max_ln_beats,
+            )
+
+    class ManiaTransformerV4(nn.Module):
         def __init__(self):
             super().__init__()
-            self.diff_emb   = nn.Embedding(diff_levels, diff_emb)
-            self.input_proj = nn.Linear(feat_dim + diff_emb, d_model)
-            self.conv_block = PatternConvBlock(d_model, drop=dropout)
-            self.pos_enc    = PositionalEncoding(d_model, drop=dropout)
-            enc_layer       = nn.TransformerEncoderLayer(
+            self.diff_emb    = nn.Embedding(diff_levels, diff_emb)
+            self.input_proj  = nn.Linear(feat_dim + diff_emb, d_model)
+            self.conv_block  = PatternConvBlock(d_model, drop=dropout)
+            self.pos_enc     = PositionalEncoding(d_model, drop=dropout)
+            enc_layer        = nn.TransformerEncoderLayer(
                 d_model, nhead, dim_feedforward=dim_ff,
                 dropout=dropout, batch_first=True, norm_first=True)
             self.transformer = nn.TransformerEncoder(enc_layer, num_layers)
             self.norm        = nn.LayerNorm(d_model)
-            self.heads       = nn.ModuleList([
-                nn.Sequential(
-                    nn.Linear(d_model, d_model // 2),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(d_model // 2, 4),
-                )
+            self.pattern_head = nn.Sequential(
+                nn.Linear(d_model, d_model // 4),
+                nn.GELU(),
+                nn.Linear(d_model // 4, num_patterns),
+            )
+            self.heads = nn.ModuleList([
+                DiffHead(d_model, drop=dropout)
                 for _ in range(diff_levels)
             ])
 
@@ -249,9 +316,11 @@ def _build_transformer(feat_dim, diff_levels, diff_emb, d_model, nhead,
             h = self.pos_enc(h)
             h = self.transformer(h)
             h = self.norm(h)
-            return [head(h) for head in self.heads]   # list of (B, T, 4)
+            pattern_logits = self.pattern_head(h)
+            head_outputs   = [head(h) for head in self.heads]
+            return head_outputs, pattern_logits   # matches trainer output
 
-    return ManiaTransformerV3()
+    return ManiaTransformerV4()
 
 
 def load_nn_model(model_path):
@@ -262,25 +331,28 @@ def load_nn_model(model_path):
     try:
         ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
 
-        # Read hyperparams saved by trainer (with sensible fallbacks)
-        feat_dim    = ckpt.get("feat_dim",    _NN_FEAT_DIM)
-        diff_levels = ckpt.get("diff_levels", 4)
-        diff_emb    = ckpt.get("diff_emb",    8)
-        d_model     = ckpt.get("d_model",     256)
-        nhead       = ckpt.get("nhead",       8)
-        num_layers  = ckpt.get("num_layers",  4)
-        dim_ff      = ckpt.get("dim_ff",      1024)
-        dropout     = ckpt.get("dropout",     0.1)
+        # Read hyperparams saved by trainer (with V4 defaults)
+        feat_dim     = ckpt.get("feat_dim",      _NN_FEAT_DIM)
+        diff_levels  = ckpt.get("diff_levels",   4)
+        diff_emb     = ckpt.get("diff_emb",      32)
+        d_model      = ckpt.get("d_model",       384)
+        nhead        = ckpt.get("nhead",         8)
+        num_layers   = ckpt.get("num_layers",    6)
+        dim_ff       = ckpt.get("dim_ff",        1536)
+        dropout      = ckpt.get("dropout",       0.20)
+        max_ln_beats = ckpt.get("max_ln_beats",  _NN_MAX_LN_BEATS)
+        num_patterns = ckpt.get("num_patterns",  _NN_NUM_PATTERNS)
 
-        model_type  = ckpt.get("model_type", "ManiaTransformerV3")
-        if "V3" not in model_type:
-            print(f"   [warn] Checkpoint type '{model_type}' — retrain with ManiaNNTrainer.py for best results")
+        model_type = ckpt.get("model_type", "ManiaTransformerV4")
+        if "V4" not in model_type:
+            print(f"   [warn] Checkpoint type '{model_type}' — retrain with ManiaNNTrainer.py for V4 features")
 
         m = _build_transformer(feat_dim, diff_levels, diff_emb,
-                               d_model, nhead, num_layers, dim_ff, dropout)
+                               d_model, nhead, num_layers, dim_ff, dropout,
+                               max_ln_beats=max_ln_beats, num_patterns=num_patterns)
         m.load_state_dict(ckpt["model_state"])
         m.eval()
-        return {"model": m, "meta": ckpt}
+        return {"model": m, "meta": ckpt, "max_ln_beats": max_ln_beats}
     except Exception as e:
         print(f"   [warn] Could not load model: {e}"); return None
 
@@ -293,21 +365,25 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord
     except ImportError:
         return []
 
-    model  = nn_model_data["model"]
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model        = nn_model_data["model"]
+    max_ln_beats = nn_model_data.get("max_ln_beats", _NN_MAX_LN_BEATS)
+    beat_length  = audio_data["beat_length"]
+    device       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
 
     positions = audio_data["positions"]
-    feat_full = audio_data["feat_full"]       # (T, 124) — pre-computed in analyze_audio
+    feat_full = audio_data["feat_full"]       # (T, 130) — pre-computed in analyze_audio
     diff_idx  = DIFF_IDX.get(difficulty, 2)
 
     if not positions:
         return [], {"all_prob": np.zeros((0, 4)), "positions": [], "threshold": 0.5}
 
-    T        = len(positions)
-    all_prob = np.zeros((T, KEYS), dtype=np.float32)
-    diff_t   = torch.tensor([diff_idx], dtype=torch.long).to(device)
+    T          = len(positions)
+    all_prob   = np.zeros((T, KEYS), dtype=np.float32)
+    all_ln_p   = np.zeros((T, KEYS), dtype=np.float32)
+    all_ln_dur = np.zeros((T, KEYS), dtype=np.float32)
+    diff_t     = torch.tensor([diff_idx], dtype=torch.long).to(device)
     CHUNK, OVERLAP = 512, 64
 
     with torch.no_grad():
@@ -316,17 +392,22 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord
             j = min(i + CHUNK, T)
             x = torch.tensor(feat_full[i:j], dtype=torch.float32).unsqueeze(0).to(device)
             d = diff_t.expand(x.size(0))
-            all_heads = model(x, d)            # list of 4 tensors (1, chunk, 4)
-            all_prob[i:j] = torch.sigmoid(all_heads[diff_idx])[0].cpu().numpy()
+            head_outputs, _ = model(x, d)      # V4: (list of DiffHead tuples, pattern_logits)
+            hit_logits, ln_logits, ln_dur = head_outputs[diff_idx]
+            all_prob[i:j]   = torch.sigmoid(hit_logits)[0].cpu().numpy()
+            all_ln_p[i:j]   = torch.sigmoid(ln_logits)[0].cpu().numpy()
+            all_ln_dur[i:j] = ln_dur[0].cpu().numpy()
             i = j - OVERLAP if j < T else T
 
-    # threshold from fill% — no max(0.20,...) floor
+    # threshold from fill%
     threshold = float(np.percentile(all_prob, (1.0 - fill) * 100))
 
     # time-ordered placement with per-step chord cap + column balance weighting
     col_last   = {c: -9999.0 for c in range(KEYS)}
     col_counts = [0] * KEYS
     placed     = []
+    # track LN end times to avoid overlapping notes in the same column
+    ln_end_by_col = {c: -9999.0 for c in range(KEYS)}
 
     for i, t in enumerate(positions):
         total_placed = sum(col_counts) + 1
@@ -334,14 +415,25 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord
         eligible = []
         for col in range(KEYS):
             p = float(all_prob[i, col])
+            # skip if inside an active LN in this column
+            if t < ln_end_by_col[col]:
+                continue
             if p >= threshold and t - col_last[col] >= MIN_GAP_MS:
-                # boost underrepresented columns, penalise overrepresented ones
                 bal = avg_per_col / max(col_counts[col], 1)
-                bal = min(max(bal, 0.25), 4.0)   # clamp to avoid extremes
+                bal = min(max(bal, 0.25), 4.0)
                 eligible.append((p * bal, col))
         eligible.sort(reverse=True)
         for _, col in eligible[:max_chord]:
-            placed.append((round(t), col, False, 0))
+            p_ln = float(all_ln_p[i, col])
+            if p_ln > 0.5:
+                # LN: duration in beats → ms, minimum 1 beat
+                dur_beats  = float(all_ln_dur[i, col])
+                dur_beats  = max(dur_beats, 1.0)
+                ln_end_ms  = round(t + dur_beats * beat_length)
+                placed.append((round(t), col, True, ln_end_ms))
+                ln_end_by_col[col] = ln_end_ms
+            else:
+                placed.append((round(t), col, False, 0))
             col_last[col]   = t
             col_counts[col] += 1
 
