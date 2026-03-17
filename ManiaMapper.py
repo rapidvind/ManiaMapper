@@ -17,16 +17,18 @@ KEYS   = 4
 COL_X  = [64, 192, 320, 448]
 
 DIFFICULTY_PRESETS = {
-    "Easy":   {"hp": 6, "od": 6,  "fill": 0.04, "max_chord": 1},
-    "Normal": {"hp": 7, "od": 7,  "fill": 0.07, "max_chord": 2},
-    "Hard":   {"hp": 8, "od": 8,  "fill": 0.12, "max_chord": 3},
-    "Insane": {"hp": 9, "od": 9,  "fill": 0.16, "max_chord": 3},
+    "Easy":   {"hp": 6, "od": 6,  "fill": 0.02,  "max_chord": 1},
+    "Normal": {"hp": 7, "od": 7,  "fill": 0.035, "max_chord": 2},
+    "Hard":   {"hp": 8, "od": 8,  "fill": 0.06,  "max_chord": 3},
+    "Insane": {"hp": 9, "od": 9,  "fill": 0.8,  "max_chord": 2},
 }
 
-MIN_GAP_MS        = 40.0
+MIN_GAP_SAME_COL_MS  = 80.0   # min ms between notes in the same column
+MIN_GAP_DIFF_COL_MS  = 10.0   # guard against sub-16th timing bleed between columns
+MIN_GAP_AFTER_LN_MS  = 30.0   # min ms between LN release and next note in same column
 _NN_SR            = 22050
 _NN_HOP           = 512
-_NN_SUBDIV        = 4          # 16th-note inference grid
+_NN_SUBDIV        = 8          # 32nd-note inference grid (matches training SUBDIV)
 _NN_N_MEL         = 80
 _NN_N_SC          = 7
 _NN_N_CHROMA      = 12
@@ -415,13 +417,18 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord
         eligible = []
         for col in range(KEYS):
             p = float(all_prob[i, col])
-            # skip if inside an active LN in this column
-            if t < ln_end_by_col[col]:
+            # skip if inside an active LN or within the release gap
+            if t < ln_end_by_col[col] + MIN_GAP_AFTER_LN_MS:
                 continue
-            if p >= threshold and t - col_last[col] >= MIN_GAP_MS:
-                bal = avg_per_col / max(col_counts[col], 1)
-                bal = min(max(bal, 0.25), 4.0)
-                eligible.append((p * bal, col))
+            # same-column gap
+            if not (p >= threshold and t - col_last[col] >= MIN_GAP_SAME_COL_MS):
+                continue
+            # diff-column gap: ensure no other column was just hit within MIN_GAP_DIFF_COL_MS
+            if any(t - col_last[c] < MIN_GAP_DIFF_COL_MS for c in range(KEYS) if c != col):
+                continue
+            bal = avg_per_col / max(col_counts[col], 1)
+            bal = min(max(bal, 0.25), 4.0)
+            eligible.append((p * bal, col))
         eligible.sort(reverse=True)
         for _, col in eligible[:max_chord]:
             p_ln = float(all_ln_p[i, col])
