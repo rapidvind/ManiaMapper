@@ -803,24 +803,38 @@ def train(maps_dir, out_path, max_maps, epochs):
 
     SIBLING_WEIGHT = 0.2
 
+    history = {"total": [], "hit": [], "ln": [], "ln_dur": [], "pattern": [], "pat_acc": []}
+    # Accumulate ground-truth pattern distribution once (first pass)
+    pat_gt_dist = np.zeros(NUM_PATTERNS, dtype=np.int64)
+    for batch in loader:
+        _, _, _, _, y_pat, _ = batch
+        for p in y_pat.reshape(-1).tolist():
+            pat_gt_dist[int(p)] += 1
+    history["pat_gt_dist"] = pat_gt_dist.tolist()
+
     for epoch in range(1, epochs + 1):
         model.train()
-        total_loss = 0.0
-        n_batches  = 0
+        totals = {"total": 0.0, "hit": 0.0, "ln": 0.0, "ln_dur": 0.0, "pattern": 0.0}
+        pat_correct = 0
+        pat_total   = 0
+        n_batches   = 0
 
         for batch in loader:
             X, y_hit, y_ln, y_ln_dur, y_pattern, diff = batch
-            X        = X.to(device)
-            y_hit    = y_hit.to(device)
-            y_ln     = y_ln.to(device)
-            y_ln_dur = y_ln_dur.to(device)
+            X         = X.to(device)
+            y_hit     = y_hit.to(device)
+            y_ln      = y_ln.to(device)
+            y_ln_dur  = y_ln_dur.to(device)
             y_pattern = y_pattern.to(device)
-            diff     = diff.to(device)
+            diff      = diff.to(device)
 
             optimizer.zero_grad()
             all_heads, pattern_logits = model(X, diff)
 
-            loss = torch.tensor(0.0, device=device)
+            loss     = torch.tensor(0.0, device=device)
+            l_hit    = torch.tensor(0.0, device=device)
+            l_ln     = torch.tensor(0.0, device=device)
+            l_ln_dur = torch.tensor(0.0, device=device)
 
             # ── Per-difficulty losses ──────────────────────────────────────────
             for d in range(DIFF_LEVELS):
@@ -836,32 +850,33 @@ def train(maps_dir, out_path, max_maps, epochs):
                 pw_val    = max(pw_val, 2.0)
                 pos_weight = torch.tensor([pw_val] * 4, device=device)
 
-                loss = loss + F.binary_cross_entropy_with_logits(
-                    hit_logits[mask], y_hit[mask],
-                    pos_weight=pos_weight,
-                )
+                _lh = F.binary_cross_entropy_with_logits(
+                    hit_logits[mask], y_hit[mask], pos_weight=pos_weight)
+                loss = loss + _lh
+                l_hit = l_hit + _lh
 
                 # 2. LN classification loss on actual hit positions
                 hit_pos = y_hit[mask] > 0.5
                 if hit_pos.any():
-                    loss = loss + 0.4 * F.binary_cross_entropy_with_logits(
-                        ln_logits[mask][hit_pos],
-                        y_ln[mask][hit_pos],
-                    )
+                    _ll = 0.4 * F.binary_cross_entropy_with_logits(
+                        ln_logits[mask][hit_pos], y_ln[mask][hit_pos])
+                    loss = loss + _ll
+                    l_ln = l_ln + _ll
 
                 # 3. LN duration regression on actual LN positions
                 ln_pos = y_ln[mask] > 0.5
                 if ln_pos.any():
-                    loss = loss + 0.15 * F.mse_loss(
-                        ln_dur[mask][ln_pos],
-                        y_ln_dur[mask][ln_pos],
-                    )
+                    _ld = 0.15 * F.mse_loss(
+                        ln_dur[mask][ln_pos], y_ln_dur[mask][ln_pos])
+                    loss = loss + _ld
+                    l_ln_dur = l_ln_dur + _ld
 
             # 4. Pattern type auxiliary loss (all samples)
-            loss = loss + 0.15 * F.cross_entropy(
+            l_pat = 0.15 * F.cross_entropy(
                 pattern_logits.reshape(-1, NUM_PATTERNS),
                 y_pattern.reshape(-1),
             )
+            loss = loss + l_pat
 
             # 5. Sibling diff auxiliary (hit loss only, weight=0.2)
             if SIBLING_WEIGHT > 0:
@@ -878,20 +893,67 @@ def train(maps_dir, out_path, max_maps, epochs):
                             continue
                         hit_logits2, _, _ = all_heads[d2]
                         loss = loss + SIBLING_WEIGHT * F.binary_cross_entropy_with_logits(
-                            hit_logits2[mask], y_hit[mask],
-                            pos_weight=pos_weight,
-                        )
+                            hit_logits2[mask], y_hit[mask], pos_weight=pos_weight)
 
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            total_loss += loss.item()
-            n_batches  += 1
+
+            totals["total"]   += loss.item()
+            totals["hit"]     += l_hit.item()
+            totals["ln"]      += l_ln.item()
+            totals["ln_dur"]  += l_ln_dur.item()
+            totals["pattern"] += l_pat.item()
+
+            # Pattern accuracy
+            with torch.no_grad():
+                pred_pat = pattern_logits.reshape(-1, NUM_PATTERNS).argmax(dim=-1)
+                true_pat = y_pattern.reshape(-1)
+                pat_correct += (pred_pat == true_pat).sum().item()
+                pat_total   += true_pat.numel()
+
+            n_batches += 1
 
         scheduler.step()
-        avg_loss = total_loss / max(n_batches, 1)
-        print(f"  Epoch {epoch:3d}/{epochs}  loss: {avg_loss:.4f}  "
+        nb = max(n_batches, 1)
+        for k in totals:
+            history[k].append(totals[k] / nb)
+        history["pat_acc"].append(pat_correct / max(pat_total, 1))
+
+        print(f"  Epoch {epoch:3d}/{epochs}  loss: {history['total'][-1]:.4f}  "
+              f"hit: {history['hit'][-1]:.3f}  ln: {history['ln'][-1]:.3f}  "
+              f"pat: {history['pattern'][-1]:.3f}  pat_acc: {history['pat_acc'][-1]*100:.1f}%  "
               f"lr: {optimizer.param_groups[0]['lr']:.2e}")
+
+    # ── Post-training: confusion matrix + column balance ──────────────────────
+    print("\nComputing post-training diagnostics...")
+    model.eval()
+    conf_matrix = np.zeros((NUM_PATTERNS, NUM_PATTERNS), dtype=np.int64)
+    col_balance = {n: [0] * 4 for n in DIFF_NAMES}
+
+    with torch.no_grad():
+        for batch in loader:
+            X, y_hit, y_ln, y_ln_dur, y_pattern, diff = batch
+            X         = X.to(device)
+            y_pattern = y_pattern.to(device)
+            diff      = diff.to(device)
+
+            all_heads, pattern_logits = model(X, diff)
+
+            pred_pat = pattern_logits.reshape(-1, NUM_PATTERNS).argmax(dim=-1).cpu().numpy()
+            true_pat = y_pattern.reshape(-1).cpu().numpy()
+            for t, p in zip(true_pat, pred_pat):
+                conf_matrix[int(t), int(p)] += 1
+
+            # Column balance from hit predictions per difficulty
+            for di in range(DIFF_LEVELS):
+                mask = (diff == di).cpu()
+                if not mask.any():
+                    continue
+                hit_logits, _, _ = all_heads[di]
+                hit_pred = (torch.sigmoid(hit_logits[diff == di]) > 0.5).cpu().numpy()
+                for col in range(4):
+                    col_balance[DIFF_NAMES[di]][col] += int(hit_pred[:, :, col].sum())
 
     torch.save({
         "model_type":     "ManiaTransformerV4",
@@ -916,7 +978,131 @@ def train(maps_dir, out_path, max_maps, epochs):
 
     print(f"\nModel saved -> {out_path}")
     print(f"  Maps : {len(sequences)}   Sequences : {len(dataset)}")
+    save_training_report(history, conf_matrix, col_balance, out_path)
     print(f'\nNext: python ManiaMapper.py --ui')
+
+
+# ── Training report ───────────────────────────────────────────────────────────
+
+PATTERN_NAMES = ["REST", "SINGLE", "CHORD", "JACK", "TRILL",
+                 "STAIR_U", "STAIR_D", "STREAM", "LN"]
+DIFF_NAMES    = ["Easy", "Normal", "Hard", "Insane"]
+
+
+def save_training_report(history, conf_matrix, col_balance, out_path):
+    """
+    Save a training report PNG next to the model file.
+    history     : dict of lists — keys: total, hit, ln, ln_dur, pattern, pat_acc
+    conf_matrix : (NUM_PATTERNS, NUM_PATTERNS) numpy array
+    col_balance : dict[diff_name] -> list[4] note counts per column
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.gridspec as gridspec
+    except ImportError:
+        print("  [info] pip install matplotlib for training report"); return
+
+    BG, SURF = "#0e0b1a", "#130e22"
+    PINK, BLUE, GREEN, ORANGE = "#ff66ab", "#4aa8d4", "#4caf82", "#f0a030"
+    DIM = "#9d8cbb"
+
+    fig = plt.figure(figsize=(22, 14), facecolor=BG)
+    gs  = gridspec.GridSpec(2, 4, figure=fig, hspace=0.38, wspace=0.35,
+                            left=0.06, right=0.97, top=0.92, bottom=0.07)
+
+    def _ax(r, c, colspan=1):
+        ax = fig.add_subplot(gs[r, c] if colspan == 1 else gs[r, c:c+colspan])
+        ax.set_facecolor(SURF)
+        ax.tick_params(colors=DIM, labelsize=8)
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#3a2d62")
+        return ax
+
+    epochs = list(range(1, len(history["total"]) + 1))
+
+    # ── 1. Total loss curve ───────────────────────────────────────────────────
+    ax = _ax(0, 0)
+    ax.plot(epochs, history["total"], color=PINK, linewidth=1.5, label="total")
+    ax.set_title("Total Loss", color=DIM, fontsize=9)
+    ax.set_xlabel("Epoch", color=DIM, fontsize=8)
+    ax.set_ylabel("Loss", color=DIM, fontsize=8)
+
+    # ── 2. Component loss curves ──────────────────────────────────────────────
+    ax = _ax(0, 1)
+    ax.plot(epochs, history["hit"],     color=BLUE,   linewidth=1.2, label="hit BCE")
+    ax.plot(epochs, history["ln"],      color=GREEN,  linewidth=1.2, label="LN BCE")
+    ax.plot(epochs, history["ln_dur"],  color=ORANGE, linewidth=1.2, label="LN dur MSE")
+    ax.plot(epochs, history["pattern"], color=PINK,   linewidth=1.2, label="pattern CE")
+    ax.legend(fontsize=7, facecolor=SURF, edgecolor="#3a2d62", labelcolor=DIM)
+    ax.set_title("Loss Components", color=DIM, fontsize=9)
+    ax.set_xlabel("Epoch", color=DIM, fontsize=8)
+
+    # ── 3. Pattern accuracy over epochs ──────────────────────────────────────
+    ax = _ax(0, 2)
+    ax.plot(epochs, [v * 100 for v in history["pat_acc"]], color=GREEN, linewidth=1.5)
+    ax.set_ylim(0, 100)
+    ax.set_title("Pattern Accuracy (%)", color=DIM, fontsize=9)
+    ax.set_xlabel("Epoch", color=DIM, fontsize=8)
+    ax.set_ylabel("%", color=DIM, fontsize=8)
+
+    # ── 4. Ground-truth pattern distribution ─────────────────────────────────
+    ax = _ax(0, 3)
+    pat_gt = history.get("pat_gt_dist", [0] * NUM_PATTERNS)
+    total_gt = max(sum(pat_gt), 1)
+    pct_gt = [v / total_gt * 100 for v in pat_gt]
+    colors = [BLUE, GREEN, ORANGE, PINK, "#c084fc", "#56d4a0", "#f87171", "#fbbf24", "#a78bfa"]
+    ax.bar(range(NUM_PATTERNS), pct_gt, color=colors, alpha=0.85)
+    ax.set_xticks(range(NUM_PATTERNS))
+    ax.set_xticklabels(PATTERN_NAMES, rotation=45, ha="right", fontsize=7, color=DIM)
+    ax.set_title("Ground-Truth Pattern Distribution", color=DIM, fontsize=9)
+    ax.set_ylabel("%", color=DIM, fontsize=8)
+
+    # ── 5. Pattern confusion matrix ───────────────────────────────────────────
+    ax = _ax(1, 0, colspan=2)
+    if conf_matrix is not None and conf_matrix.sum() > 0:
+        # Normalize rows
+        row_sums = conf_matrix.sum(axis=1, keepdims=True)
+        cm_norm  = conf_matrix / np.maximum(row_sums, 1)
+        im = ax.imshow(cm_norm, cmap="magma", vmin=0, vmax=1, aspect="auto")
+        plt.colorbar(im, ax=ax, fraction=0.03, pad=0.02).ax.tick_params(colors=DIM, labelsize=7)
+        ax.set_xticks(range(NUM_PATTERNS))
+        ax.set_yticks(range(NUM_PATTERNS))
+        ax.set_xticklabels(PATTERN_NAMES, rotation=45, ha="right", fontsize=7, color=DIM)
+        ax.set_yticklabels(PATTERN_NAMES, fontsize=7, color=DIM)
+        ax.set_title("Pattern Confusion Matrix (row-normalized)", color=DIM, fontsize=9)
+        ax.set_xlabel("Predicted", color=DIM, fontsize=8)
+        ax.set_ylabel("True", color=DIM, fontsize=8)
+        for i in range(NUM_PATTERNS):
+            for j in range(NUM_PATTERNS):
+                v = cm_norm[i, j]
+                ax.text(j, i, f"{v:.2f}", ha="center", va="center",
+                        fontsize=6, color="white" if v < 0.6 else "black")
+
+    # ── 6. Column balance per difficulty ──────────────────────────────────────
+    ax = _ax(1, 2, colspan=2)
+    diff_colors = [GREEN, BLUE, ORANGE, PINK]
+    x = np.arange(4)
+    w = 0.18
+    for di, dname in enumerate(DIFF_NAMES):
+        counts = col_balance.get(dname, [0] * 4)
+        total  = max(sum(counts), 1)
+        pct    = [c / total * 100 for c in counts]
+        ax.bar(x + di * w, pct, w, label=dname, color=diff_colors[di], alpha=0.85)
+    ax.axhline(25, color="white", linewidth=0.8, linestyle="--", alpha=0.4)
+    ax.set_xticks(x + w * 1.5)
+    ax.set_xticklabels(["Col 1", "Col 2", "Col 3", "Col 4"], color=DIM, fontsize=9)
+    ax.set_title("Column Balance per Difficulty (%)", color=DIM, fontsize=9)
+    ax.set_ylabel("%", color=DIM, fontsize=8)
+    ax.legend(fontsize=8, facecolor=SURF, edgecolor="#3a2d62", labelcolor=DIM)
+
+    fig.suptitle("ManiaTransformerV4 — Training Report", color=PINK, fontsize=12, y=0.97)
+
+    report_path = os.path.splitext(out_path)[0] + "_training_report.png"
+    plt.savefig(report_path, dpi=140, bbox_inches="tight", facecolor=BG)
+    plt.close()
+    print(f"  Training report → {report_path}")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
