@@ -1,0 +1,15 @@
+stages:
+  - deploy
+
+deploy:
+  stage: deploy
+  tags:
+    - production
+  only:
+    - main
+  script:
+    - cd /home/deploy/maniamapper
+    - git pull origin main
+    - source venv/bin/activate
+    - pip install -r requirements.txt --quiet
+    - sudo systemctl restart maniamapper
