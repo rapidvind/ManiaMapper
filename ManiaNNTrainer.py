@@ -18,7 +18,7 @@ What's new in v4
     cross-diff context (16)     — sibling map hit_labels for same audio
 
   Architecture: PatternConvBlock(k=3,5,9,13) + Transformer + 4 DiffHeads
-    + pattern auxiliary head (9 pattern classes)
+    + pattern auxiliary head (18 pattern classes)
     Long-note (LN) support: ln_labels, ln_dur regression
 
   Training:
@@ -56,7 +56,7 @@ SEQ_LEN     = 256
 DIFF_LEVELS = 4
 DIFF_EMB    = 32
 MAX_LN_BEATS = 16.0       # max LN duration in beats
-NUM_PATTERNS = 9          # pattern type classes
+NUM_PATTERNS = 18         # pattern type classes
 
 # Transformer hyper-parameters
 D_MODEL  = 384
@@ -65,16 +65,25 @@ N_LAYERS = 6
 DIM_FF   = 1536
 DROPOUT  = 0.20
 
-# Pattern constants
-PATTERN_REST    = 0
-PATTERN_SINGLE  = 1
-PATTERN_CHORD   = 2
-PATTERN_JACK    = 3
-PATTERN_TRILL   = 4
-PATTERN_STAIR_U = 5
-PATTERN_STAIR_D = 6
-PATTERN_STREAM  = 7
-PATTERN_LN      = 8
+# Pattern constants — 18 classes
+PATTERN_REST          = 0
+PATTERN_SINGLE        = 1
+PATTERN_CHORD_2       = 2
+PATTERN_CHORD_3       = 3
+PATTERN_JACK          = 4
+PATTERN_CHORD_JACK    = 5
+PATTERN_TRILL_2COL    = 6
+PATTERN_TRILL_STAIR_U = 7
+PATTERN_TRILL_STAIR_D = 8
+PATTERN_TRILL_SPLIT   = 9
+PATTERN_TRILL_CHORD   = 10
+PATTERN_STREAM        = 11
+PATTERN_COMPLEX_STREAM= 12
+PATTERN_JUMP_STREAM   = 13
+PATTERN_LN_START      = 14
+PATTERN_COMPLEX_LN    = 15
+PATTERN_CHORD_LN      = 16
+PATTERN_MELODY_LN     = 17
 
 DEFAULT_MAPS_DIR = r"C:\Users\Aravind Dora\Desktop\ManiaMapper\ManiaStyles"
 DEFAULT_OUT      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mania_model.pt")
@@ -375,84 +384,161 @@ def extract_labels(groups, positions, beat_length):
     return hit_labels, ln_labels, ln_dur_lbls
 
 
-def derive_pattern_types(hit_labels, ln_labels):
+def derive_pattern_types(hit_labels, ln_labels, ln_dur_lbls):
     """
-    Derive pattern type for each timestep.
-    hit_labels: (T, 4), ln_labels: (T, 4)
+    Derive pattern type for each timestep — 18-class system.
+
+    hit_labels  : (T, 4) float32
+    ln_labels   : (T, 4) float32
+    ln_dur_lbls : (T, 4) float32  — LN duration in beats
+    beat_length : float            — ms per beat
+
     Returns int64 array (T,).
+
+    Class definitions
+    -----------------
+    REST(0)           — no note
+    SINGLE(1)         — one note, no special context
+    CHORD_2(2)        — exactly 2 simultaneous notes
+    CHORD_3(3)        — 3 or 4 simultaneous notes
+    JACK(4)           — single note on a column repeated from ≤4 steps ago
+    CHORD_JACK(5)     — same chord (same cols) ≥3 consecutive times
+    TRILL_2COL(6)     — 2-note unit (single cols) repeating ≥4 times
+    TRILL_STAIR_U(7)  — unit is a strictly ascending staircase, repeating ≥4 times
+    TRILL_STAIR_D(8)  — unit is a strictly descending staircase, repeating ≥4 times
+    TRILL_SPLIT(9)    — mixed single-note unit repeating ≥4 times
+    TRILL_CHORD(10)   — unit contains at least one chord, repeating ≥4 times
+    STREAM(11)        — high density (≥0.5), chord_ratio <10 %
+    COMPLEX_STREAM(12)— high density, chord_ratio 10–30 %
+    JUMP_STREAM(13)   — high density, chord_ratio >30 %
+    LN_START(14)      — single LN starts, no other simultaneous notes
+    COMPLEX_LN(15)    — LN start + other simultaneous notes at same step
+    CHORD_LN(16)      — LN being held + 2 or more new notes fire
+    MELODY_LN(17)     — LN being held + exactly 1 new note fires
     """
     T = hit_labels.shape[0]
+
+    # ── precompute step signatures (frozenset of active cols) ─────────────────
+    step_sigs = [
+        frozenset(int(c) for c in np.where(hit_labels[t] > 0.5)[0])
+        for t in range(T)
+    ]
+
+    # ── precompute ongoing LN holds ───────────────────────────────────────────
+    # ln_active[t, col] = True if an LN started at s < t and its hold covers t
+    ln_active = np.zeros((T, 4), dtype=bool)
+    for s in range(T):
+        for col in range(4):
+            if ln_labels[s, col] > 0.5 and ln_dur_lbls[s, col] > 0:
+                dur_steps = max(1, int(round(ln_dur_lbls[s, col] * SUBDIV)))
+                end_step  = min(T, s + dur_steps)
+                ln_active[s + 1:end_step, col] = True
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+    def find_trill(t, min_repeats=4):
+        """
+        Collect recent non-empty step sigs (up to 32 back) and test whether a
+        unit of length 2, 3, or 4 repeats ≥ min_repeats consecutive times
+        ending at t.  Returns the unit (list of frozensets) or None.
+        """
+        recent = [step_sigs[s] for s in range(max(0, t - 32), t + 1)
+                  if step_sigs[s]]
+        for unit_len in [2, 3, 4]:
+            needed = unit_len * min_repeats
+            if len(recent) < needed:
+                continue
+            window = recent[-needed:]
+            unit   = window[:unit_len]
+            if all(window[i] == unit[i % unit_len] for i in range(needed)):
+                return unit
+        return None
+
+    def classify_trill(unit):
+        if any(len(s) >= 2 for s in unit):
+            return PATTERN_TRILL_CHORD
+        cols = [next(iter(s)) for s in unit]
+        if len(cols) == 2:
+            return PATTERN_TRILL_2COL
+        if all(cols[i] < cols[i + 1] for i in range(len(cols) - 1)):
+            return PATTERN_TRILL_STAIR_U
+        if all(cols[i] > cols[i + 1] for i in range(len(cols) - 1)):
+            return PATTERN_TRILL_STAIR_D
+        return PATTERN_TRILL_SPLIT
+
+    # ── main loop ─────────────────────────────────────────────────────────────
     pattern_types = np.zeros(T, dtype=np.int64)
 
     for t in range(T):
-        active_cols = np.where(hit_labels[t] > 0.5)[0]
-        n_active    = len(active_cols)
+        sig      = step_sigs[t]
+        n_active = len(sig)
 
+        # ── REST ──────────────────────────────────────────────────────────────
         if n_active == 0:
             pattern_types[t] = PATTERN_REST
             continue
 
-        # LN start takes precedence
-        if ln_labels[t, active_cols].any():
-            pattern_types[t] = PATTERN_LN
+        ln_starts    = frozenset(c for c in sig if ln_labels[t, c] > 0.5)
+        active_holds = frozenset(int(c) for c in np.where(ln_active[t])[0])
+
+        # ── LN hold + new notes ───────────────────────────────────────────────
+        if active_holds:
+            new_hits = len(sig)         # all notes at this step are "new"
+            if new_hits == 1:
+                pattern_types[t] = PATTERN_MELODY_LN
+            else:
+                pattern_types[t] = PATTERN_CHORD_LN
             continue
 
-        if n_active >= 2:
-            pattern_types[t] = PATTERN_CHORD
+        # ── LN start events ───────────────────────────────────────────────────
+        if ln_starts:
+            if n_active == 1:
+                pattern_types[t] = PATTERN_LN_START
+            else:
+                pattern_types[t] = PATTERN_COMPLEX_LN
             continue
 
-        col = int(active_cols[0])
-
-        # Look back up to 4 steps
-        lookback = min(t, 4)
-        prev_cols = []
-        for k in range(1, lookback + 1):
-            prev_active = np.where(hit_labels[t - k] > 0.5)[0]
-            if len(prev_active) > 0:
-                prev_cols.append(prev_active.tolist())
-
-        # Jack: same column appears in any of the last 4 steps
-        is_jack = False
-        for pcols in prev_cols:
-            if col in pcols:
-                is_jack = True
-                break
-        if is_jack:
-            pattern_types[t] = PATTERN_JACK
+        # ── Trill (repeating unit ≥ 4 times) ─────────────────────────────────
+        trill_unit = find_trill(t)
+        if trill_unit is not None:
+            pattern_types[t] = classify_trill(trill_unit)
             continue
 
-        # Collect single-note columns from last 4 steps
-        single_col_history = []
-        for k in range(1, lookback + 1):
-            prev_active = np.where(hit_labels[t - k] > 0.5)[0]
-            if len(prev_active) == 1:
-                single_col_history.append(int(prev_active[0]))
-        single_col_history = single_col_history[:3]  # up to 3 previous single notes
-
-        # Trill: alternating between exactly 2 columns over last 4 steps
-        all_single_cols = [col] + single_col_history
-        if len(all_single_cols) >= 4:
-            unique_cols = set(all_single_cols[:4])
-            if len(unique_cols) == 2:
-                cols_seq = all_single_cols[:4]
-                is_trill = all(
-                    cols_seq[i] != cols_seq[i + 1] for i in range(len(cols_seq) - 1)
-                )
-                if is_trill:
-                    pattern_types[t] = PATTERN_TRILL
-                    continue
-
-        # Stair up/down: strictly ascending or descending cols over last 4 steps
-        if len(all_single_cols) >= 4:
-            cols_seq = all_single_cols[:4]
-            if all(cols_seq[i] < cols_seq[i + 1] for i in range(len(cols_seq) - 1)):
-                pattern_types[t] = PATTERN_STAIR_U
-                continue
-            if all(cols_seq[i] > cols_seq[i + 1] for i in range(len(cols_seq) - 1)):
-                pattern_types[t] = PATTERN_STAIR_D
+        # ── Chord jack (same chord ≥ 3 consecutive steps) ─────────────────────
+        if n_active >= 2 and t >= 2:
+            if step_sigs[t - 1] == sig and step_sigs[t - 2] == sig:
+                pattern_types[t] = PATTERN_CHORD_JACK
                 continue
 
-        pattern_types[t] = PATTERN_STREAM
+        # ── Stream (density window of 8 steps) ───────────────────────────────
+        if t >= 7:
+            window      = [step_sigs[s] for s in range(t - 7, t + 1)]
+            non_empty   = [s for s in window if s]
+            density     = len(non_empty) / 8.0
+            if density >= 0.5:
+                chord_ratio = sum(1 for s in non_empty if len(s) >= 2) / max(len(non_empty), 1)
+                if chord_ratio < 0.10:
+                    pattern_types[t] = PATTERN_STREAM
+                elif chord_ratio < 0.30:
+                    pattern_types[t] = PATTERN_COMPLEX_STREAM
+                else:
+                    pattern_types[t] = PATTERN_JUMP_STREAM
+                continue
+
+        # ── Jack (single note on same col as recent step) ─────────────────────
+        if n_active == 1:
+            col = next(iter(sig))
+            is_jack = any(col in step_sigs[t - k] for k in range(1, min(t + 1, 5)))
+            if is_jack:
+                pattern_types[t] = PATTERN_JACK
+                continue
+            pattern_types[t] = PATTERN_SINGLE
+            continue
+
+        # ── Chord ─────────────────────────────────────────────────────────────
+        if n_active == 2:
+            pattern_types[t] = PATTERN_CHORD_2
+        else:
+            pattern_types[t] = PATTERN_CHORD_3
 
     return pattern_types
 
@@ -481,7 +567,7 @@ def extract_features_and_labels(audio_path, groups, version_str):
         elif note_ratio < 0.28: diff_level = 2
         else:                   diff_level = 3
 
-    pattern_types = derive_pattern_types(hit_labels, ln_labels)
+    pattern_types = derive_pattern_types(hit_labels, ln_labels, ln_dur_lbls)
 
     return feat_audio, hit_labels, ln_labels, ln_dur_lbls, pattern_types, diff_level, audio_path
 
@@ -812,6 +898,20 @@ def train(maps_dir, out_path, max_maps, epochs):
             pat_gt_dist[int(p)] += 1
     history["pat_gt_dist"] = pat_gt_dist.tolist()
 
+    # ── class-weighted pattern loss ───────────────────────────────────────────
+    # Inverse-frequency weights so rare patterns (TRILL_CHORD, JUMP_STREAM, etc.)
+    # are not drowned out by REST / SINGLE which dominate the label distribution.
+    total_pat_steps = max(int(pat_gt_dist.sum()), 1)
+    raw_w = total_pat_steps / (
+        NUM_PATTERNS * np.maximum(pat_gt_dist, 1).astype(np.float32)
+    )
+    raw_w = np.clip(raw_w, 0.1, 20.0)   # cap individual class weights at 20×
+    pat_class_weights = torch.tensor(raw_w, dtype=torch.float32, device=device)
+    print(f"Pattern class weights (capped 0.1-20):")
+    for k, (n, w) in enumerate(zip(PATTERN_NAMES, raw_w.tolist())):
+        print(f"  {k:2d} {n:<16s} count={pat_gt_dist[k]:8d}  weight={w:.3f}")
+    print()
+
     for epoch in range(1, epochs + 1):
         model.train()
         totals = {"total": 0.0, "hit": 0.0, "ln": 0.0, "ln_dur": 0.0, "pattern": 0.0}
@@ -871,10 +971,11 @@ def train(maps_dir, out_path, max_maps, epochs):
                     loss = loss + _ld
                     l_ln_dur = l_ln_dur + _ld
 
-            # 4. Pattern type auxiliary loss (all samples)
-            l_pat = 0.15 * F.cross_entropy(
+            # 4. Pattern type auxiliary loss (all samples, class-weighted)
+            l_pat = 0.25 * F.cross_entropy(
                 pattern_logits.reshape(-1, NUM_PATTERNS),
                 y_pattern.reshape(-1),
+                weight=pat_class_weights,
             )
             loss = loss + l_pat
 
@@ -984,8 +1085,12 @@ def train(maps_dir, out_path, max_maps, epochs):
 
 # ── Training report ───────────────────────────────────────────────────────────
 
-PATTERN_NAMES = ["REST", "SINGLE", "CHORD", "JACK", "TRILL",
-                 "STAIR_U", "STAIR_D", "STREAM", "LN"]
+PATTERN_NAMES = [
+    "REST", "SINGLE", "CHORD_2", "CHORD_3", "JACK", "CHORD_JACK",
+    "TRILL_2COL", "TRILL_STAIR_U", "TRILL_STAIR_D", "TRILL_SPLIT", "TRILL_CHORD",
+    "STREAM", "COMPLEX_STR", "JUMP_STR",
+    "LN_START", "COMPLEX_LN", "CHORD_LN", "MELODY_LN",
+]
 DIFF_NAMES    = ["Easy", "Normal", "Hard", "Insane"]
 
 
@@ -1052,7 +1157,12 @@ def save_training_report(history, conf_matrix, col_balance, out_path):
     pat_gt = history.get("pat_gt_dist", [0] * NUM_PATTERNS)
     total_gt = max(sum(pat_gt), 1)
     pct_gt = [v / total_gt * 100 for v in pat_gt]
-    colors = [BLUE, GREEN, ORANGE, PINK, "#c084fc", "#56d4a0", "#f87171", "#fbbf24", "#a78bfa"]
+    colors = [
+        BLUE, GREEN, ORANGE, PINK, "#c084fc", "#56d4a0",
+        "#f87171", "#fbbf24", "#a78bfa", "#34d399", "#fb923c",
+        "#60a5fa", "#e879f9", "#f472b6",
+        "#22d3ee", "#4ade80", "#facc15", "#f43f5e",
+    ]
     ax.bar(range(NUM_PATTERNS), pct_gt, color=colors, alpha=0.85)
     ax.set_xticks(range(NUM_PATTERNS))
     ax.set_xticklabels(PATTERN_NAMES, rotation=45, ha="right", fontsize=7, color=DIM)

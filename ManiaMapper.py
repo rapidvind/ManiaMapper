@@ -12,7 +12,7 @@ import os, sys, argparse, zipfile
 import numpy as np
 
 # ─── CONSTANTS ────────────────────────────────────────────────────────────────
-
+# git token : glpat-OS28tW93eRL18_HIMuti4G86MQp1OmwydjN0Cw.01.121ag3g0x
 KEYS   = 4
 COL_X  = [64, 192, 320, 448]
 
@@ -20,7 +20,7 @@ DIFFICULTY_PRESETS = {
     "Easy":   {"hp": 6, "od": 6,  "fill": 0.02,  "max_chord": 1},
     "Normal": {"hp": 7, "od": 7,  "fill": 0.035, "max_chord": 2},
     "Hard":   {"hp": 8, "od": 8,  "fill": 0.06,  "max_chord": 3},
-    "Insane": {"hp": 9, "od": 9,  "fill": 0.8,  "max_chord": 2},
+    "Insane": {"hp": 9, "od": 9,  "fill": 0.8,  "max_chord": 1},
 }
 
 MIN_GAP_SAME_COL_MS  = 80.0   # min ms between notes in the same column
@@ -38,7 +38,7 @@ _NN_FEAT_DIM_AUDIO = 114
 _NN_FEAT_DIM_CTX  = 16         # zeros at inference (no sibling maps)
 _NN_FEAT_DIM      = _NN_FEAT_DIM_AUDIO + _NN_FEAT_DIM_CTX               # 130
 _NN_MAX_LN_BEATS  = 16.0       # max LN duration in beats
-_NN_NUM_PATTERNS  = 9
+_NN_NUM_PATTERNS  = 18
 
 DIFF_IDX = {"Easy": 0, "Normal": 1, "Hard": 2, "Insane": 3}
 
@@ -382,9 +382,10 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord
         return [], {"all_prob": np.zeros((0, 4)), "positions": [], "threshold": 0.5}
 
     T          = len(positions)
-    all_prob   = np.zeros((T, KEYS), dtype=np.float32)
-    all_ln_p   = np.zeros((T, KEYS), dtype=np.float32)
-    all_ln_dur = np.zeros((T, KEYS), dtype=np.float32)
+    all_prob       = np.zeros((T, KEYS),              dtype=np.float32)
+    all_ln_p       = np.zeros((T, KEYS),              dtype=np.float32)
+    all_ln_dur     = np.zeros((T, KEYS),              dtype=np.float32)
+    all_pat_logits = np.zeros((T, _NN_NUM_PATTERNS),  dtype=np.float32)
     diff_t     = torch.tensor([diff_idx], dtype=torch.long).to(device)
     CHUNK, OVERLAP = 512, 64
 
@@ -394,54 +395,76 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord
             j = min(i + CHUNK, T)
             x = torch.tensor(feat_full[i:j], dtype=torch.float32).unsqueeze(0).to(device)
             d = diff_t.expand(x.size(0))
-            head_outputs, _ = model(x, d)      # V4: (list of DiffHead tuples, pattern_logits)
+            head_outputs, pat_logits = model(x, d)   # capture pattern logits
             hit_logits, ln_logits, ln_dur = head_outputs[diff_idx]
-            all_prob[i:j]   = torch.sigmoid(hit_logits)[0].cpu().numpy()
-            all_ln_p[i:j]   = torch.sigmoid(ln_logits)[0].cpu().numpy()
-            all_ln_dur[i:j] = ln_dur[0].cpu().numpy()
+            all_prob[i:j]       = torch.sigmoid(hit_logits)[0].cpu().numpy()
+            all_ln_p[i:j]       = torch.sigmoid(ln_logits)[0].cpu().numpy()
+            all_ln_dur[i:j]     = ln_dur[0].cpu().numpy()
+            all_pat_logits[i:j] = pat_logits[0].cpu().numpy()
             i = j - OVERLAP if j < T else T
 
     # threshold from fill%
     threshold = float(np.percentile(all_prob, (1.0 - fill) * 100))
 
-    # time-ordered placement with per-step chord cap + column balance weighting
-    col_last   = {c: -9999.0 for c in range(KEYS)}
-    col_counts = [0] * KEYS
-    placed     = []
-    # track LN end times to avoid overlapping notes in the same column
+    # time-ordered placement — model's hit_logits drive everything.
+    # The shared transformer backbone has already learned audio→pattern context,
+    # so hit probabilities implicitly encode what pattern belongs here.
+    # We add only one safeguard: if greedy selection produces 10+ consecutive
+    # steps alternating between the same 2 columns, gently dampen those columns
+    # so the model isn't stuck in a degenerate loop (this is a per-column
+    # probability artifact, not a pattern-learning issue).
+    from collections import deque
+    col_last      = {c: -9999.0 for c in range(KEYS)}
+    col_counts    = [0] * KEYS
+    placed        = []
     ln_end_by_col = {c: -9999.0 for c in range(KEYS)}
+    recent_cols   = deque(maxlen=10)  # track last 10 placed single-note cols
 
     for i, t in enumerate(positions):
         total_placed = sum(col_counts) + 1
         avg_per_col  = total_placed / KEYS
+
+        # ── degenerate-trill guard ────────────────────────────────────────────
+        # Only kicks in after 10 consecutive alternating steps between 2 cols.
+        rc = list(recent_cols)
+        trill_cols = set()
+        if len(rc) >= 10:
+            unique10 = set(rc[-10:])
+            if len(unique10) == 2:
+                if all(rc[-10:][k] != rc[-10:][k + 1] for k in range(9)):
+                    trill_cols = unique10   # these two cols are stuck looping
+
         eligible = []
         for col in range(KEYS):
             p = float(all_prob[i, col])
-            # skip if inside an active LN or within the release gap
             if t < ln_end_by_col[col] + MIN_GAP_AFTER_LN_MS:
                 continue
-            # same-column gap
             if not (p >= threshold and t - col_last[col] >= MIN_GAP_SAME_COL_MS):
                 continue
-            # diff-column gap: ensure no other column was just hit within MIN_GAP_DIFF_COL_MS
             if any(t - col_last[c] < MIN_GAP_DIFF_COL_MS for c in range(KEYS) if c != col):
                 continue
+
             bal = avg_per_col / max(col_counts[col], 1)
             bal = min(max(bal, 0.25), 4.0)
-            eligible.append((p * bal, col))
+
+            # gentle dampen only when stuck in degenerate 10-step trill loop
+            dampen = 0.4 if col in trill_cols else 1.0
+
+            eligible.append((p * bal * dampen, col))
+
         eligible.sort(reverse=True)
         for _, col in eligible[:max_chord]:
             p_ln = float(all_ln_p[i, col])
             if p_ln > 0.5:
-                # LN: duration in beats → ms, minimum 1 beat
-                dur_beats  = float(all_ln_dur[i, col])
-                dur_beats  = max(dur_beats, 1.0)
-                ln_end_ms  = round(t + dur_beats * beat_length)
+                dur_beats = float(all_ln_dur[i, col])
+                dur_beats = max(dur_beats, 1.0)
+                ln_end_ms = round(t + dur_beats * beat_length)
                 placed.append((round(t), col, True, ln_end_ms))
                 ln_end_by_col[col] = ln_end_ms
             else:
                 placed.append((round(t), col, False, 0))
-            col_last[col]   = t
+                recent_cols.append(col)
+            col_last[col]    = t
             col_counts[col] += 1
 
     return placed, {"all_prob": all_prob, "positions": positions, "threshold": threshold}
