@@ -8,8 +8,9 @@ deploy:
   only:
     - main
   script:
-    - cp -r $CI_PROJECT_DIR/. /home/deploy/maniamapper/
-    - cd /home/deploy/maniamapper
+    - cp $CI_PROJECT_DIR/ManiaMapper.py /mnt/data/maniamapper/
+    - cp $CI_PROJECT_DIR/requirements.txt /mnt/data/maniamapper/
+    - cd /mnt/data/maniamapper
     - source venv/bin/activate
     - pip install -r requirements.txt --quiet
     - echo "Deploy complete"
