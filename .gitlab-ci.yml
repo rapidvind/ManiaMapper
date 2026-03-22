@@ -15,4 +15,5 @@ deploy:
     - cd /mnt/data/maniamapper
     - source venv/bin/activate
     - pip install -r requirements.txt --quiet
+    - sudo systemctl restart maniamapper
     - echo "Deploy complete"
