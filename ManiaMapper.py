@@ -703,7 +703,9 @@ def write_osu(settings, audio_data, notes, sv_points, output_path):
         f"HPDrainRate:{d['hp']}", f"CircleSize:{KEYS}",
         f"OverallDifficulty:{d['od']}", "ApproachRate:5",
         "SliderMultiplier:1.4", "SliderTickRate:1",
-        "", "[Events]", "//Background and Video events", "//Break Periods",
+        "", "[Events]", "//Background and Video events",
+        f'0,0,"bg.jpg",0,0' if settings.get("bg_path") else "",
+        "//Break Periods",
         "", "[TimingPoints]",
         f"0,{audio_data['beat_length']:.6f},4,2,1,100,1,0",
     ]
@@ -729,6 +731,8 @@ def build_osz(settings, audio_data, notes, sv_points, output_path):
         zf.writestr(f"{safe_a} - {safe_t} [{settings['difficulty']}].osu",
                     content.encode("utf-8"))
         zf.write(settings["audio_path"], os.path.basename(settings["audio_path"]))
+        if settings.get("bg_path") and os.path.isfile(settings["bg_path"]):
+            zf.write(settings["bg_path"], "bg.jpg")
     return count
 
 
@@ -1390,6 +1394,7 @@ def main():
     parser.add_argument("--artist",           help="Artist name (skips prompt)", default="")
     parser.add_argument("--difficulty",       help="Difficulty: Easy/Normal/Hard/Insane", default="")
     parser.add_argument("--no-sv", action="store_true", help="Disable SV (skips prompt)")
+    parser.add_argument("--bg",               help="Background image path")
     args = parser.parse_args()
 
     if args.ui:
@@ -1427,6 +1432,7 @@ def main():
     else:
         settings = get_user_settings(args.audio)
     settings["audio_path"] = args.audio
+    settings["bg_path"]    = args.bg or ""
     audio_data = analyze_audio(args.audio)
 
     print("[2/3] Generating notes...")

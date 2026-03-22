@@ -16,6 +16,9 @@ import uuid
 import tempfile
 import subprocess
 import sys
+import urllib.request
+import urllib.parse
+import json as _json
 from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
@@ -78,6 +81,33 @@ async def generate(
     with open(audio_path, "wb") as f:
         f.write(await audio.read())
 
+    # ── Fetch album art from iTunes ───────────────────────────────────────────
+    bg_path = None
+    search_term = " ".join(filter(None, [artist, title]))
+    if search_term:
+        try:
+            query = urllib.parse.urlencode({"term": search_term, "media": "music", "limit": "1"})
+            req   = urllib.request.Request(
+                f"https://itunes.apple.com/search?{query}",
+                headers={"User-Agent": "ManiaMapper/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = _json.loads(resp.read())
+            if data.get("results"):
+                art_url = data["results"][0].get("artworkUrl100", "")
+                art_url = art_url.replace("100x100bb", "600x600bb")
+                if art_url:
+                    candidate = job_dir / "bg.jpg"
+                    urllib.request.urlretrieve(art_url, str(candidate))
+                    # validate: must be a readable image with reasonable dimensions
+                    from PIL import Image as _Img
+                    with _Img.open(str(candidate)) as im:
+                        w, h = im.size
+                    if w >= 100 and h >= 100:
+                        bg_path = candidate
+        except Exception:
+            bg_path = None   # silently skip — map still generates without background
+
     # ── Run ManiaMapper ───────────────────────────────────────────────────────
     safe = lambda s: "".join(c for c in s if c.isalnum() or c in " -_") or "map"
     osz_name = f"{safe(artist)} - {safe(title)} [{difficulty}].osz" if title else f"map [{difficulty}].osz"
@@ -94,6 +124,8 @@ async def generate(
         cmd += ["--title", title]
     if artist:
         cmd += ["--artist", artist]
+    if bg_path:
+        cmd += ["--bg", str(bg_path)]
 
     try:
         result = subprocess.run(
