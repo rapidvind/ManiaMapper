@@ -147,11 +147,14 @@ async def generate(
         raise HTTPException(500, "No .osz file was produced.")
 
     osz_path = osz_files[0]
+    encoded  = urllib.parse.quote(osz_path.name)
     return FileResponse(
         path=str(osz_path),
         media_type="application/octet-stream",
-        filename=osz_path.name,
-        headers={"X-Job-Id": job_id},
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded}",
+            "X-Job-Id": job_id,
+        },
     )
 
 
