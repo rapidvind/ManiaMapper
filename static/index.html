@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ManiaMapper</title>
+  <style>
+    :root {
+      --bg:       #0f0f1a;
+      --panel:    #1a1a2e;
+      --accent:   #e84393;
+      --accent2:  #a855f7;
+      --text:     #e0e0f0;
+      --sub:      #888aaa;
+      --border:   #2a2a4a;
+      --success:  #22c55e;
+      --error:    #ef4444;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Segoe UI', sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem;
+    }
+
+    .logo {
+      font-size: 2.4rem;
+      font-weight: 800;
+      letter-spacing: -1px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 0.3rem;
+    }
+
+    .tagline {
+      color: var(--sub);
+      font-size: 0.95rem;
+      margin-bottom: 2.5rem;
+      text-align: center;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 2rem;
+      width: 100%;
+      max-width: 480px;
+    }
+
+    .drop-zone {
+      border: 2px dashed var(--border);
+      border-radius: 12px;
+      padding: 2.5rem 1rem;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+      margin-bottom: 1.5rem;
+    }
+
+    .drop-zone:hover, .drop-zone.drag-over {
+      border-color: var(--accent);
+      background: rgba(232,67,147,0.05);
+    }
+
+    .drop-zone .icon { font-size: 2.5rem; margin-bottom: 0.5rem; }
+    .drop-zone .hint { color: var(--sub); font-size: 0.85rem; margin-top: 0.3rem; }
+    .drop-zone .filename { color: var(--accent); font-size: 0.9rem; margin-top: 0.5rem; font-weight: 600; }
+
+    #file-input { display: none; }
+
+    .field { margin-bottom: 1.2rem; }
+    .field label { display: block; font-size: 0.8rem; color: var(--sub); margin-bottom: 0.4rem; text-transform: uppercase; letter-spacing: 0.05em; }
+
+    .field input, .field select {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      padding: 0.6rem 0.9rem;
+      font-size: 0.95rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .field input:focus, .field select:focus { border-color: var(--accent2); }
+
+    .diff-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 0.5rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .diff-btn {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--sub);
+      padding: 0.5rem;
+      font-size: 0.8rem;
+      cursor: pointer;
+      text-align: center;
+      transition: all 0.15s;
+    }
+
+    .diff-btn:hover { border-color: var(--accent2); color: var(--text); }
+    .diff-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(232,67,147,0.1); font-weight: 700; }
+
+    .generate-btn {
+      width: 100%;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border: none;
+      border-radius: 10px;
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 700;
+      padding: 0.85rem;
+      cursor: pointer;
+      transition: opacity 0.2s;
+      letter-spacing: 0.03em;
+    }
+
+    .generate-btn:hover { opacity: 0.9; }
+    .generate-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .status {
+      margin-top: 1.2rem;
+      padding: 0.8rem 1rem;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      display: none;
+    }
+
+    .status.info    { background: rgba(168,85,247,0.1); border: 1px solid var(--accent2); color: var(--accent2); }
+    .status.success { background: rgba(34,197,94,0.1);  border: 1px solid var(--success);  color: var(--success); }
+    .status.error   { background: rgba(239,68,68,0.1);  border: 1px solid var(--error);    color: var(--error); }
+
+    .progress-bar {
+      height: 4px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+      margin-top: 0.6rem;
+      display: none;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      width: 0%;
+      transition: width 0.3s;
+      animation: indeterminate 1.5s infinite;
+    }
+
+    @keyframes indeterminate {
+      0%   { transform: translateX(-100%); width: 60%; }
+      100% { transform: translateX(200%);  width: 60%; }
+    }
+
+    footer {
+      margin-top: 2rem;
+      color: var(--sub);
+      font-size: 0.78rem;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="logo">ManiaMapper</div>
+  <p class="tagline">AI-powered osu!mania 4K map generator</p>
+
+  <div class="card">
+
+    <!-- Drop zone -->
+    <div class="drop-zone" id="drop-zone">
+      <div class="icon">🎵</div>
+      <div>Drop your audio file here</div>
+      <div class="hint">MP3 · OGG · WAV · FLAC · M4A</div>
+      <div class="filename" id="file-name"></div>
+    </div>
+    <input type="file" id="file-input" accept=".mp3,.ogg,.wav,.flac,.m4a" />
+
+    <!-- Metadata -->
+    <div class="field">
+      <label>Song Title</label>
+      <input type="text" id="title" placeholder="(optional)" />
+    </div>
+    <div class="field">
+      <label>Artist</label>
+      <input type="text" id="artist" placeholder="(optional)" />
+    </div>
+
+    <!-- Difficulty -->
+    <div class="field">
+      <label>Difficulty</label>
+    </div>
+    <div class="diff-grid">
+      <div class="diff-btn" data-diff="Easy">Easy</div>
+      <div class="diff-btn active" data-diff="Normal">Normal</div>
+      <div class="diff-btn" data-diff="Hard">Hard</div>
+      <div class="diff-btn" data-diff="Insane">Insane</div>
+    </div>
+
+    <button class="generate-btn" id="gen-btn" disabled>Generate Map</button>
+
+    <div class="progress-bar" id="progress-bar"><div class="progress-fill"></div></div>
+    <div class="status" id="status"></div>
+
+  </div>
+
+  <footer>Powered by ManiaTransformerV4 &nbsp;·&nbsp; osu!mania 4K</footer>
+
+  <script>
+    const dropZone  = document.getElementById('drop-zone');
+    const fileInput = document.getElementById('file-input');
+    const fileName  = document.getElementById('file-name');
+    const genBtn    = document.getElementById('gen-btn');
+    const statusEl  = document.getElementById('status');
+    const progressBar = document.getElementById('progress-bar');
+
+    let selectedFile = null;
+    let selectedDiff = 'Normal';
+
+    // ── File selection ────────────────────────────────────────────────────────
+    dropZone.addEventListener('click', () => fileInput.click());
+    dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+    dropZone.addEventListener('drop', e => {
+      e.preventDefault();
+      dropZone.classList.remove('drag-over');
+      const f = e.dataTransfer.files[0];
+      if (f) setFile(f);
+    });
+    fileInput.addEventListener('change', () => { if (fileInput.files[0]) setFile(fileInput.files[0]); });
+
+    function setFile(f) {
+      selectedFile = f;
+      fileName.textContent = f.name;
+      genBtn.disabled = false;
+    }
+
+    // ── Difficulty ────────────────────────────────────────────────────────────
+    document.querySelectorAll('.diff-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.diff-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        selectedDiff = btn.dataset.diff;
+      });
+    });
+
+    // ── Generate ──────────────────────────────────────────────────────────────
+    genBtn.addEventListener('click', async () => {
+      if (!selectedFile) return;
+
+      genBtn.disabled = true;
+      progressBar.style.display = 'block';
+      showStatus('Generating your map… this may take up to 60 seconds.', 'info');
+
+      const form = new FormData();
+      form.append('audio',      selectedFile);
+      form.append('difficulty', selectedDiff);
+      form.append('title',      document.getElementById('title').value);
+      form.append('artist',     document.getElementById('artist').value);
+
+      try {
+        const res = await fetch('/api/generate', { method: 'POST', body: form });
+
+        if (!res.ok) {
+          const err = await res.text();
+          throw new Error(err);
+        }
+
+        const blob = await res.blob();
+        const url  = URL.createObjectURL(blob);
+        const a    = document.createElement('a');
+        const cd   = res.headers.get('content-disposition') || '';
+        const name = cd.match(/filename="?([^"]+)"?/)?.[1] || 'map.osz';
+        a.href = url; a.download = name; a.click();
+        URL.revokeObjectURL(url);
+
+        showStatus('Map generated! Your download should start automatically.', 'success');
+      } catch (e) {
+        showStatus('Error: ' + e.message, 'error');
+      } finally {
+        genBtn.disabled = false;
+        progressBar.style.display = 'none';
+      }
+    });
+
+    function showStatus(msg, type) {
+      statusEl.textContent = msg;
+      statusEl.className   = `status ${type}`;
+      statusEl.style.display = 'block';
+    }
+  </script>
+</body>
+</html>
