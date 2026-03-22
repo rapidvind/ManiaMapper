@@ -8,8 +8,8 @@ deploy:
   only:
     - main
   script:
+    - cp -r $CI_PROJECT_DIR/. /home/deploy/maniamapper/
     - cd /home/deploy/maniamapper
-    - git pull origin main
     - source venv/bin/activate
     - pip install -r requirements.txt --quiet
     - echo "Deploy complete"
