@@ -9,7 +9,9 @@ deploy:
     - main
   script:
     - cp $CI_PROJECT_DIR/ManiaMapper.py /mnt/data/maniamapper/
+    - cp $CI_PROJECT_DIR/app.py /mnt/data/maniamapper/
     - cp $CI_PROJECT_DIR/requirements.txt /mnt/data/maniamapper/
+    - cp -r $CI_PROJECT_DIR/static /mnt/data/maniamapper/
     - cd /mnt/data/maniamapper
     - source venv/bin/activate
     - pip install -r requirements.txt --quiet
