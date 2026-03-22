@@ -6,7 +6,10 @@ __pycache__/
 venv/
 env/
 
-# Model weights
+# Training data
+ManiaStyles/
+
+# Model weights (push manually with git add -f)
 *.pt
 *.pth
 *.onnx
