@@ -1386,6 +1386,10 @@ def main():
     parser.add_argument("--output", "-o",     help="Output .osz path")
     parser.add_argument("--nn",               help="Path to mania_model.pt")
     parser.add_argument("--ui", action="store_true", help="Open graphical UI")
+    parser.add_argument("--title",            help="Song title (skips prompt)", default="")
+    parser.add_argument("--artist",           help="Artist name (skips prompt)", default="")
+    parser.add_argument("--difficulty",       help="Difficulty: Easy/Normal/Hard/Insane", default="")
+    parser.add_argument("--no-sv", action="store_true", help="Disable SV (skips prompt)")
     args = parser.parse_args()
 
     if args.ui:
@@ -1411,7 +1415,17 @@ def main():
         print("ERROR: Failed to load model."); sys.exit(1)
     print(f"  Trained on {nn_model['meta'].get('maps_trained', '?')} maps")
 
-    settings = get_user_settings(args.audio)
+    if args.title or args.artist or args.difficulty:
+        import os as _os
+        base = _os.path.splitext(_os.path.basename(args.audio))[0]
+        settings = {
+            "title":      args.title  or base,
+            "artist":     args.artist or "Unknown",
+            "difficulty": args.difficulty if args.difficulty in DIFFICULTY_PRESETS else "Hard",
+            "sv":         not args.no_sv,
+        }
+    else:
+        settings = get_user_settings(args.audio)
     settings["audio_path"] = args.audio
     audio_data = analyze_audio(args.audio)
 

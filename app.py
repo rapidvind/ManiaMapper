@@ -79,12 +79,16 @@ async def generate(
         f.write(await audio.read())
 
     # ── Run ManiaMapper ───────────────────────────────────────────────────────
+    safe = lambda s: "".join(c for c in s if c.isalnum() or c in " -_") or "map"
+    osz_name = f"{safe(artist)} - {safe(title)} [{difficulty}].osz" if title else f"map [{difficulty}].osz"
+    osz_out  = job_dir / osz_name
     cmd = [
         sys.executable, str(BASE_DIR / "ManiaMapper.py"),
-        "--audio",      str(audio_path),
-        "--model",      str(MODEL_PATH),
+        str(audio_path),
+        "--nn",         str(MODEL_PATH),
+        "--output",     str(osz_out),
         "--difficulty", difficulty,
-        "--out",        str(job_dir),
+        "--no-sv",
     ]
     if title:
         cmd += ["--title", title]
