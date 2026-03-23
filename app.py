@@ -13,7 +13,7 @@ Usage:
 
 import os
 import uuid
-import tempfile
+import shutil
 import subprocess
 import sys
 import urllib.request
@@ -21,7 +21,7 @@ import urllib.parse
 import json as _json
 from pathlib import Path
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,7 +38,8 @@ app.add_middleware(
 BASE_DIR    = Path(__file__).parent
 MODEL_PATH  = BASE_DIR / "mania_model.pt"
 STATIC_DIR  = BASE_DIR / "static"
-WORK_DIR    = Path(tempfile.gettempdir()) / "maniamapper_jobs"
+# Use the large data disk so audio uploads don't fill the boot disk
+WORK_DIR    = Path("/mnt/data/tmp/maniamapper_jobs")
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
 VALID_DIFFICULTIES = {"Easy", "Normal", "Hard", "Insane"}
@@ -56,6 +57,7 @@ def health():
 
 @app.post("/api/generate")
 async def generate(
+    background_tasks: BackgroundTasks,
     audio: UploadFile = File(...),
     difficulty: str   = Form("Hard"),
     title: str        = Form(""),
@@ -148,6 +150,7 @@ async def generate(
 
     osz_path = osz_files[0]
     encoded  = urllib.parse.quote(osz_path.name)
+    background_tasks.add_task(shutil.rmtree, str(job_dir), True)
     return FileResponse(
         path=str(osz_path),
         media_type="application/octet-stream",
