@@ -8,11 +8,12 @@ deploy:
   only:
     - main
   script:
-    - cp $CI_PROJECT_DIR/ManiaMapper.py /mnt/data/maniamapper/
-    - cp $CI_PROJECT_DIR/app.py /mnt/data/maniamapper/
-    - cp $CI_PROJECT_DIR/requirements.txt /mnt/data/maniamapper/
-    - cp -r $CI_PROJECT_DIR/static /mnt/data/maniamapper/
-    - cd /mnt/data/maniamapper
+    - cp $CI_PROJECT_DIR/ManiaMapper.py /opt/maniamapper/
+    - cp $CI_PROJECT_DIR/app.py /opt/maniamapper/
+    - cp $CI_PROJECT_DIR/requirements.txt /opt/maniamapper/
+    - cp -r $CI_PROJECT_DIR/static /opt/maniamapper/
+    - '[ -f $CI_PROJECT_DIR/mania_model.pt ] && cp $CI_PROJECT_DIR/mania_model.pt /opt/maniamapper/ || true'
+    - cd /opt/maniamapper
     - source venv/bin/activate
     - pip install -r requirements.txt --quiet
     - sudo systemctl restart maniamapper
