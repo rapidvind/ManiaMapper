@@ -8,6 +8,7 @@ env/
 
 # Training data
 ManiaStyles/
+_feat_cache/
 
 # Model weights tracked via Git LFS
 *.onnx
