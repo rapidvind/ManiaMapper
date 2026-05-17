@@ -9,9 +9,7 @@ env/
 # Training data
 ManiaStyles/
 
-# Model weights (push manually with git add -f)
-*.pt
-*.pth
+# Model weights tracked via Git LFS
 *.onnx
 
 # Generated outputs

@@ -38,8 +38,7 @@ app.add_middleware(
 BASE_DIR    = Path(__file__).parent
 MODEL_PATH  = BASE_DIR / "mania_model.pt"
 STATIC_DIR  = BASE_DIR / "static"
-# Use the large data disk so audio uploads don't fill the boot disk
-WORK_DIR    = Path("/mnt/data/tmp/maniamapper_jobs")
+WORK_DIR    = Path("/tmp/maniamapper_jobs")
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
 VALID_DIFFICULTIES = {"Easy", "Normal", "Hard", "Insane"}

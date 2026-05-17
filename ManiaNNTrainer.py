@@ -49,21 +49,21 @@ SR          = 22050
 # Audio features: mel(80) + onset(1) + onset_harm(1) + onset_perc(1) + sc(7) +
 #                 chroma(12) + rms(1) + flatness(1) + centroid(1) + zcr(1) +
 #                 phases_4scales(8) = 114
-FEAT_DIM_AUDIO = 114
-FEAT_DIM_CTX   = 16       # cross-diff context (4 diffs × 4 cols)
-FEAT_DIM       = FEAT_DIM_AUDIO + FEAT_DIM_CTX   # = 130
+FEAT_DIM_AUDIO    = 114
+FEAT_DIM_CTX      = 16       # cross-diff context (4 diffs × 4 cols)
+FEAT_DIM_COL_HIST = 16       # column history (last 4 placed cols, one-hot 4×4)
+FEAT_DIM          = FEAT_DIM_AUDIO + FEAT_DIM_CTX + FEAT_DIM_COL_HIST  # = 146
 SEQ_LEN     = 256
 DIFF_LEVELS = 4
 DIFF_EMB    = 32
 MAX_LN_BEATS = 16.0       # max LN duration in beats
 NUM_PATTERNS = 18         # pattern type classes
 
-# Transformer hyper-parameters
-D_MODEL  = 384
-NHEAD    = 8
-N_LAYERS = 6
-DIM_FF   = 1536
-DROPOUT  = 0.20
+# CNN + BiLSTM hyper-parameters
+D_MODEL     = 384
+LSTM_HIDDEN = D_MODEL // 2   # bidirectional → output = 2×192 = 384 = D_MODEL
+LSTM_LAYERS = 4
+DROPOUT     = 0.20
 
 # Pattern constants — 18 classes
 PATTERN_REST          = 0
@@ -350,6 +350,66 @@ def extract_audio_features(audio_path):
     return feat_audio, frame_times, beat_length, duration_ms, positions, beat_times
 
 
+# ── Feature cache (disk + in-memory) ──────────────────────────────────────────
+
+_MEM_CACHE = {}   # audio_path → result tuple, lives for one training run
+
+def _cache_path(audio_path, cache_dir):
+    import hashlib
+    key = hashlib.md5(os.path.abspath(audio_path).encode()).hexdigest()
+    return os.path.join(cache_dir, key + ".npz")
+
+def extract_audio_features_cached(audio_path, cache_dir):
+    """
+    Like extract_audio_features() but with two caching layers:
+      1. In-memory dict — free for same audio used by multiple .osu files.
+      2. Disk .npz — survives across training runs; invalidated if audio changes.
+    """
+    global _MEM_CACHE
+
+    abs_path = os.path.abspath(audio_path)
+    if abs_path in _MEM_CACHE:
+        return _MEM_CACHE[abs_path]
+
+    cp = _cache_path(audio_path, cache_dir)
+    if os.path.isfile(cp):
+        try:
+            if os.path.getmtime(cp) >= os.path.getmtime(audio_path):
+                d = np.load(cp, allow_pickle=False)
+                result = (
+                    d["feat_audio"],
+                    d["frame_times"],
+                    float(d["beat_length"]),
+                    float(d["duration_ms"]),
+                    d["positions"].tolist(),
+                    d["beat_times"],
+                )
+                _MEM_CACHE[abs_path] = result
+                return result
+        except Exception:
+            pass   # corrupt cache — recompute below
+
+    result = extract_audio_features(audio_path)
+    if result is None:
+        return None
+
+    _MEM_CACHE[abs_path] = result
+    os.makedirs(cache_dir, exist_ok=True)
+    feat_audio, frame_times, beat_length, duration_ms, positions, beat_times = result
+    try:
+        np.savez_compressed(cp,
+            feat_audio=feat_audio,
+            frame_times=frame_times,
+            beat_length=np.float64(beat_length),
+            duration_ms=np.float64(duration_ms),
+            positions=np.array(positions, dtype=np.float64),
+            beat_times=beat_times,
+        )
+    except Exception:
+        pass   # cache write failure is non-fatal
+    return result
+
+
 def extract_labels(groups, positions, beat_length):
     """
     Map hit groups to label arrays.
@@ -387,45 +447,18 @@ def extract_labels(groups, positions, beat_length):
 def derive_pattern_types(hit_labels, ln_labels, ln_dur_lbls):
     """
     Derive pattern type for each timestep — 18-class system.
-
-    hit_labels  : (T, 4) float32
-    ln_labels   : (T, 4) float32
-    ln_dur_lbls : (T, 4) float32  — LN duration in beats
-    beat_length : float            — ms per beat
-
-    Returns int64 array (T,).
-
-    Class definitions
-    -----------------
-    REST(0)           — no note
-    SINGLE(1)         — one note, no special context
-    CHORD_2(2)        — exactly 2 simultaneous notes
-    CHORD_3(3)        — 3 or 4 simultaneous notes
-    JACK(4)           — single note on a column repeated from ≤4 steps ago
-    CHORD_JACK(5)     — same chord (same cols) ≥3 consecutive times
-    TRILL_2COL(6)     — 2-note unit (single cols) repeating ≥4 times
-    TRILL_STAIR_U(7)  — unit is a strictly ascending staircase, repeating ≥4 times
-    TRILL_STAIR_D(8)  — unit is a strictly descending staircase, repeating ≥4 times
-    TRILL_SPLIT(9)    — mixed single-note unit repeating ≥4 times
-    TRILL_CHORD(10)   — unit contains at least one chord, repeating ≥4 times
-    STREAM(11)        — high density (≥0.5), chord_ratio <10 %
-    COMPLEX_STREAM(12)— high density, chord_ratio 10–30 %
-    JUMP_STREAM(13)   — high density, chord_ratio >30 %
-    LN_START(14)      — single LN starts, no other simultaneous notes
-    COMPLEX_LN(15)    — LN start + other simultaneous notes at same step
-    CHORD_LN(16)      — LN being held + 2 or more new notes fire
-    MELODY_LN(17)     — LN being held + exactly 1 new note fires
+    Two-pass: pass 1 labels forward (same as before), pass 2 retroactively
+    extends trill/jack/stream labels back to the actual start of each region
+    so the model sees consistent labels for entire pattern runs, not just the
+    tail end where the pattern was finally confirmed.
     """
     T = hit_labels.shape[0]
 
-    # ── precompute step signatures (frozenset of active cols) ─────────────────
     step_sigs = [
         frozenset(int(c) for c in np.where(hit_labels[t] > 0.5)[0])
         for t in range(T)
     ]
 
-    # ── precompute ongoing LN holds ───────────────────────────────────────────
-    # ln_active[t, col] = True if an LN started at s < t and its hold covers t
     ln_active = np.zeros((T, 4), dtype=bool)
     for s in range(T):
         for col in range(4):
@@ -434,17 +467,19 @@ def derive_pattern_types(hit_labels, ln_labels, ln_dur_lbls):
                 end_step  = min(T, s + dur_steps)
                 ln_active[s + 1:end_step, col] = True
 
+    LN_CLASSES     = {PATTERN_LN_START, PATTERN_COMPLEX_LN,
+                      PATTERN_CHORD_LN, PATTERN_MELODY_LN}
+    TRILL_CLASSES  = {PATTERN_TRILL_2COL, PATTERN_TRILL_STAIR_U,
+                      PATTERN_TRILL_STAIR_D, PATTERN_TRILL_SPLIT, PATTERN_TRILL_CHORD}
+    STREAM_CLASSES = {PATTERN_STREAM, PATTERN_COMPLEX_STREAM, PATTERN_JUMP_STREAM}
+
     # ── helpers ───────────────────────────────────────────────────────────────
-    def find_trill(t, min_repeats=4):
-        """
-        Collect recent non-empty step sigs (up to 32 back) and test whether a
-        unit of length 2, 3, or 4 repeats ≥ min_repeats consecutive times
-        ending at t.  Returns the unit (list of frozensets) or None.
-        """
-        recent = [step_sigs[s] for s in range(max(0, t - 32), t + 1)
-                  if step_sigs[s]]
+    MIN_TRILL_REPEATS = 3   # lowered from 4: catches shorter trills (6+ notes)
+
+    def find_trill_unit(t):
+        recent = [step_sigs[s] for s in range(max(0, t - 32), t + 1) if step_sigs[s]]
         for unit_len in [2, 3, 4]:
-            needed = unit_len * min_repeats
+            needed = unit_len * MIN_TRILL_REPEATS
             if len(recent) < needed:
                 continue
             window = recent[-needed:]
@@ -465,14 +500,13 @@ def derive_pattern_types(hit_labels, ln_labels, ln_dur_lbls):
             return PATTERN_TRILL_STAIR_D
         return PATTERN_TRILL_SPLIT
 
-    # ── main loop ─────────────────────────────────────────────────────────────
+    # ── Pass 1: forward per-step classification ───────────────────────────────
     pattern_types = np.zeros(T, dtype=np.int64)
 
     for t in range(T):
         sig      = step_sigs[t]
         n_active = len(sig)
 
-        # ── REST ──────────────────────────────────────────────────────────────
         if n_active == 0:
             pattern_types[t] = PATTERN_REST
             continue
@@ -480,40 +514,28 @@ def derive_pattern_types(hit_labels, ln_labels, ln_dur_lbls):
         ln_starts    = frozenset(c for c in sig if ln_labels[t, c] > 0.5)
         active_holds = frozenset(int(c) for c in np.where(ln_active[t])[0])
 
-        # ── LN hold + new notes ───────────────────────────────────────────────
         if active_holds:
-            new_hits = len(sig)         # all notes at this step are "new"
-            if new_hits == 1:
-                pattern_types[t] = PATTERN_MELODY_LN
-            else:
-                pattern_types[t] = PATTERN_CHORD_LN
+            pattern_types[t] = PATTERN_MELODY_LN if len(sig) == 1 else PATTERN_CHORD_LN
             continue
 
-        # ── LN start events ───────────────────────────────────────────────────
         if ln_starts:
-            if n_active == 1:
-                pattern_types[t] = PATTERN_LN_START
-            else:
-                pattern_types[t] = PATTERN_COMPLEX_LN
+            pattern_types[t] = PATTERN_LN_START if n_active == 1 else PATTERN_COMPLEX_LN
             continue
 
-        # ── Trill (repeating unit ≥ 4 times) ─────────────────────────────────
-        trill_unit = find_trill(t)
+        trill_unit = find_trill_unit(t)
         if trill_unit is not None:
             pattern_types[t] = classify_trill(trill_unit)
             continue
 
-        # ── Chord jack (same chord ≥ 3 consecutive steps) ─────────────────────
         if n_active >= 2 and t >= 2:
             if step_sigs[t - 1] == sig and step_sigs[t - 2] == sig:
                 pattern_types[t] = PATTERN_CHORD_JACK
                 continue
 
-        # ── Stream (density window of 8 steps) ───────────────────────────────
         if t >= 7:
-            window      = [step_sigs[s] for s in range(t - 7, t + 1)]
-            non_empty   = [s for s in window if s]
-            density     = len(non_empty) / 8.0
+            window    = [step_sigs[s] for s in range(t - 7, t + 1)]
+            non_empty = [s for s in window if s]
+            density   = len(non_empty) / 8.0
             if density >= 0.5:
                 chord_ratio = sum(1 for s in non_empty if len(s) >= 2) / max(len(non_empty), 1)
                 if chord_ratio < 0.10:
@@ -524,32 +546,109 @@ def derive_pattern_types(hit_labels, ln_labels, ln_dur_lbls):
                     pattern_types[t] = PATTERN_JUMP_STREAM
                 continue
 
-        # ── Jack (single note on same col as recent step) ─────────────────────
         if n_active == 1:
-            col = next(iter(sig))
+            col     = next(iter(sig))
             is_jack = any(col in step_sigs[t - k] for k in range(1, min(t + 1, 5)))
-            if is_jack:
-                pattern_types[t] = PATTERN_JACK
-                continue
-            pattern_types[t] = PATTERN_SINGLE
+            pattern_types[t] = PATTERN_JACK if is_jack else PATTERN_SINGLE
             continue
 
-        # ── Chord ─────────────────────────────────────────────────────────────
-        if n_active == 2:
-            pattern_types[t] = PATTERN_CHORD_2
-        else:
-            pattern_types[t] = PATTERN_CHORD_3
+        pattern_types[t] = PATTERN_CHORD_2 if n_active == 2 else PATTERN_CHORD_3
+
+    # ── Pass 2: retroactive relabeling ───────────────────────────────────────
+    # 2a. Trills — when a trill is confirmed at t, walk backward through
+    #     non-empty steps while they match the same cyclic unit; relabel them
+    #     so the entire trill run carries a consistent label.
+    for t in range(T):
+        if pattern_types[t] not in TRILL_CLASSES:
+            continue
+        trill_class = pattern_types[t]
+
+        ne_pairs = [(s, step_sigs[s]) for s in range(max(0, t - 128), t + 1)
+                    if step_sigs[s]]
+        ne_idxs = [s   for s, _   in ne_pairs]
+        ne_sigs = [sig for _, sig in ne_pairs]
+
+        # Reconstruct the confirmed unit
+        unit, unit_len = None, None
+        for ul in [2, 3, 4]:
+            needed = ul * MIN_TRILL_REPEATS
+            if len(ne_sigs) < needed:
+                continue
+            w = ne_sigs[-needed:]
+            u = w[:ul]
+            if all(w[i] == u[i % ul] for i in range(needed)):
+                unit, unit_len = u, ul
+                break
+        if unit is None:
+            continue
+
+        # window_start_pos: ne index of the first step in the confirmed window.
+        # ne_sigs[window_start_pos] == unit[0] by construction.
+        window_start_pos = len(ne_idxs) - unit_len * MIN_TRILL_REPEATS
+
+        # Walk backward before the confirmed window while sigs match cyclically.
+        p = window_start_pos - 1
+        while p >= 0:
+            expected = unit[(p - window_start_pos) % unit_len]
+            if ne_sigs[p] == expected:
+                p -= 1
+            else:
+                break
+
+        trill_start = ne_idxs[p + 1]
+        for s in range(trill_start, t + 1):
+            if step_sigs[s] and pattern_types[s] not in LN_CLASSES:
+                pattern_types[s] = trill_class
+
+    # 2b. Jacks — when a JACK is confirmed, walk backward through non-empty
+    #     single-note-same-col steps that were labeled SINGLE and relabel them.
+    for t in range(T):
+        if pattern_types[t] != PATTERN_JACK:
+            continue
+        sig = step_sigs[t]
+        if len(sig) != 1:
+            continue
+        col = next(iter(sig))
+
+        ne_back = [(s, step_sigs[s]) for s in range(max(0, t - 64), t) if step_sigs[s]]
+        prev_s  = t
+        for s, ssig in reversed(ne_back):
+            if ssig == frozenset({col}) and pattern_types[s] == PATTERN_SINGLE:
+                if prev_s - s <= 4:   # within jack-range gap
+                    pattern_types[s] = PATTERN_JACK
+                    prev_s = s
+                else:
+                    break
+            else:
+                break
+
+    # 2c. Streams — relabel the lead-in steps (first 7 grid steps before the
+    #     stream density threshold is met) if they were labeled SINGLE/JACK/CHORD.
+    for t in range(T):
+        if pattern_types[t] not in STREAM_CLASSES:
+            continue
+        stream_class = pattern_types[t]
+        for s in range(max(0, t - 7), t):
+            if (step_sigs[s]
+                    and pattern_types[s] not in LN_CLASSES
+                    and pattern_types[s] not in TRILL_CLASSES
+                    and pattern_types[s] in {PATTERN_SINGLE, PATTERN_JACK,
+                                              PATTERN_CHORD_2, PATTERN_CHORD_3}):
+                pattern_types[s] = stream_class
 
     return pattern_types
 
 
-def extract_features_and_labels(audio_path, groups, version_str):
+def extract_features_and_labels(audio_path, groups, version_str, cache_dir=None):
     """
     Returns (feat_audio, hit_labels, ln_labels, ln_dur_lbls, pattern_types, diff_level, audio_path)
     or (None,)*7.
     feat_audio: (T, FEAT_DIM_AUDIO) — cross-diff context added later.
     """
-    result = extract_audio_features(audio_path)
+    if cache_dir:
+        result = extract_audio_features_cached(audio_path, cache_dir)
+    else:
+        result = extract_audio_features(audio_path)
     if result is None:
         return (None,) * 7
 
@@ -570,6 +669,36 @@ def extract_features_and_labels(audio_path, groups, version_str):
     pattern_types = derive_pattern_types(hit_labels, ln_labels, ln_dur_lbls)
 
     return feat_audio, hit_labels, ln_labels, ln_dur_lbls, pattern_types, diff_level, audio_path
+
+
+# ── Column history features ───────────────────────────────────────────────────
+
+def build_col_history_features(hit_labels):
+    """
+    Build per-timestep column history from ground-truth placements.
+    At timestep t, encode the last 4 individually placed columns as one-hot
+    vectors so the model can learn sequencing patterns from training data.
+
+    Layout (16 dims): [prev1_onehot(4) | prev2_onehot(4) | prev3_onehot(4) | prev4_onehot(4)]
+    prev1 = most recently placed column before t.
+
+    hit_labels: (T, 4) float32
+    Returns:    (T, 16) float32
+    """
+    T      = hit_labels.shape[0]
+    col_hist = np.zeros((T, FEAT_DIM_COL_HIST), dtype=np.float32)
+    recent = []   # chronological list of placed columns
+
+    for t in range(T):
+        n = len(recent)
+        for k in range(min(n, 4)):
+            col = recent[n - 1 - k]   # k=0 → most recent
+            col_hist[t, k * 4 + col] = 1.0
+        for col in range(4):
+            if hit_labels[t, col] > 0.5:
+                recent.append(col)
+
+    return col_hist
 
 
 # ── Cross-difficulty context ──────────────────────────────────────────────────
@@ -600,7 +729,8 @@ def build_cross_diff_context(sequences):
                 sibling_lbl = audio_map[audio_path][d]
                 n = min(T, len(sibling_lbl))
                 ctx[:n, d * 4:(d + 1) * 4] = sibling_lbl[:n]
-        feat_full = np.concatenate([feat_audio, ctx], axis=1)   # (T, 130)
+        col_hist  = build_col_history_features(hit_lbl)                        # (T, 16)
+        feat_full = np.concatenate([feat_audio, ctx, col_hist], axis=1)        # (T, 146)
         result.append((feat_full, hit_lbl, ln_lbl, ln_dur, pat_types, diff_level))
 
     n_cross = sum(1 for ap, dmap in audio_map.items() if len(dmap) > 1)
@@ -611,56 +741,42 @@ def build_cross_diff_context(sequences):
 # ── Model ─────────────────────────────────────────────────────────────────────
 
 def build_model(feat_dim=FEAT_DIM, diff_levels=DIFF_LEVELS, diff_emb=DIFF_EMB,
-                d_model=D_MODEL, nhead=NHEAD, num_layers=N_LAYERS,
-                dim_ff=DIM_FF, dropout=DROPOUT):
+                d_model=D_MODEL, lstm_hidden=LSTM_HIDDEN, lstm_layers=LSTM_LAYERS,
+                dropout=DROPOUT):
     try:
         import torch
         import torch.nn as nn
-        import math
     except ImportError:
         print("ERROR: pip install torch"); sys.exit(1)
 
-    class PositionalEncoding(nn.Module):
-        def __init__(self, d, max_len=2048, drop=0.1):
-            super().__init__()
-            self.drop = nn.Dropout(drop)
-            pe   = torch.zeros(max_len, d)
-            pos  = torch.arange(0, max_len).unsqueeze(1).float()
-            div  = torch.exp(torch.arange(0, d, 2).float() * (-math.log(10000.0) / d))
-            pe[:, 0::2] = torch.sin(pos * div)
-            pe[:, 1::2] = torch.cos(pos * div)
-            self.register_buffer("pe", pe.unsqueeze(0))
-
-        def forward(self, x):
-            return self.drop(x + self.pe[:, :x.size(1)])
-
     class PatternConvBlock(nn.Module):
         """
-        Multi-scale 1D depthwise convolution.
+        Multi-scale 1D depthwise convolution — captures local note patterns.
         k=3  -> note pairs (jacks, 2-note bursts)
         k=5  -> trills and short streams
         k=9  -> longer streams (8-note runs)
         k=13 -> LN span detection
+        k=25 -> phrase-level repetition
         """
         def __init__(self, d, drop=0.1):
             super().__init__()
             self.convs = nn.ModuleList([
                 nn.Sequential(
-                    nn.Conv1d(d, d, k, padding=k // 2, groups=d),  # depthwise
-                    nn.Conv1d(d, d, 1),                              # pointwise
+                    nn.Conv1d(d, d, k, padding=k // 2, groups=d),
+                    nn.Conv1d(d, d, 1),
                     nn.GELU(),
                 )
-                for k in [3, 5, 9, 13]
+                for k in [3, 5, 9, 13, 25]
             ])
-            self.proj = nn.Linear(4 * d, d)
+            self.proj = nn.Linear(5 * d, d)
             self.norm = nn.LayerNorm(d)
             self.drop = nn.Dropout(drop)
 
         def forward(self, x):
-            h = x.transpose(1, 2)                                       # (B, D, T)
-            outs = [conv(h).transpose(1, 2) for conv in self.convs]     # 4×(B,T,D)
-            h = torch.cat(outs, dim=-1)                                  # (B, T, 4D)
-            return self.norm(x + self.drop(self.proj(h)))               # residual
+            h = x.transpose(1, 2)
+            outs = [conv(h).transpose(1, 2) for conv in self.convs]
+            h = torch.cat(outs, dim=-1)
+            return self.norm(x + self.drop(self.proj(h)))
 
     class DiffHead(nn.Module):
         def __init__(self, d_in, drop=0.1):
@@ -675,7 +791,6 @@ def build_model(feat_dim=FEAT_DIM, diff_levels=DIFF_LEVELS, diff_emb=DIFF_EMB,
             self.ln_dur_out = nn.Linear(d_in // 2, 4)
 
         def forward(self, h):
-            import torch
             h2 = self.shared(h)
             return (
                 self.hit_out(h2),
@@ -683,9 +798,15 @@ def build_model(feat_dim=FEAT_DIM, diff_levels=DIFF_LEVELS, diff_emb=DIFF_EMB,
                 torch.sigmoid(self.ln_dur_out(h2)) * MAX_LN_BEATS,
             )
 
-    class ManiaTransformerV4(nn.Module):
+    class ManiaCNNLSTM(nn.Module):
         """
-        v4: PatternConvBlock(k=3,5,9,13) + Transformer + 4 DiffHeads + pattern head.
+        CNN + BiLSTM architecture for osu!mania 4K generation.
+
+        Two PatternConvBlocks extract local note patterns at multiple temporal
+        scales, then a stacked BiLSTM models longer-range sequential dependencies
+        (streams, LN arcs, phrase structure).  Because the LSTM hidden state
+        encodes recent sequence history, the inference loop needs far fewer
+        hand-crafted pattern dampening heuristics.
 
         Input : x    (B, T, feat_dim)
                 diff (B,)  — difficulty index 0-3
@@ -695,16 +816,20 @@ def build_model(feat_dim=FEAT_DIM, diff_levels=DIFF_LEVELS, diff_emb=DIFF_EMB,
         """
         def __init__(self):
             super().__init__()
-            self.diff_emb    = nn.Embedding(diff_levels, diff_emb)
-            self.input_proj  = nn.Linear(feat_dim + diff_emb, d_model)
-            self.conv_block  = PatternConvBlock(d_model, drop=dropout)
-            self.pos_enc     = PositionalEncoding(d_model, drop=dropout)
-            enc_layer        = nn.TransformerEncoderLayer(
-                d_model, nhead, dim_feedforward=dim_ff,
-                dropout=dropout, batch_first=True, norm_first=True,
+            self.diff_emb   = nn.Embedding(diff_levels, diff_emb)
+            self.input_proj = nn.Linear(feat_dim + diff_emb, d_model)
+            self.conv1      = PatternConvBlock(d_model, drop=dropout)
+            self.conv2      = PatternConvBlock(d_model, drop=dropout)
+            # BiLSTM: hidden_size = lstm_hidden; bidirectional → output = 2*lstm_hidden = d_model
+            self.lstm       = nn.LSTM(
+                input_size=d_model,
+                hidden_size=lstm_hidden,
+                num_layers=lstm_layers,
+                batch_first=True,
+                bidirectional=True,
+                dropout=dropout if lstm_layers > 1 else 0.0,
             )
-            self.transformer = nn.TransformerEncoder(enc_layer, num_layers)
-            self.norm        = nn.LayerNorm(d_model)
+            self.lstm_norm  = nn.LayerNorm(d_model)
             self.pattern_head = nn.Sequential(
                 nn.Linear(d_model, d_model // 4),
                 nn.GELU(),
@@ -719,21 +844,20 @@ def build_model(feat_dim=FEAT_DIM, diff_levels=DIFF_LEVELS, diff_emb=DIFF_EMB,
             B, T, _ = x.shape
             d = self.diff_emb(diff).unsqueeze(1).expand(B, T, -1)
             h = self.input_proj(torch.cat([x, d], dim=-1))
-            h = self.conv_block(h)
-            h = self.pos_enc(h)
-            h = self.transformer(h)
-            h = self.norm(h)
-            pattern_logits = self.pattern_head(h)         # (B, T, NUM_PATTERNS)
-            head_outputs   = [head(h) for head in self.heads]   # list of 4 tuples
+            h = self.conv1(h)
+            h = self.conv2(h)
+            lstm_out, _ = self.lstm(h)
+            h = self.lstm_norm(h + lstm_out)
+            pattern_logits = self.pattern_head(h)
+            head_outputs   = [head(h) for head in self.heads]
             return head_outputs, pattern_logits
 
-    # Need torch imported here for the model to reference it
     try:
         import torch
     except ImportError:
         print("ERROR: pip install torch"); sys.exit(1)
 
-    return ManiaTransformerV4()
+    return ManiaCNNLSTM()
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
@@ -799,7 +923,9 @@ def train(maps_dir, out_path, max_maps, epochs):
     except ImportError:
         _tqdm = lambda x, **kw: x
 
+    cache_dir = os.path.join(os.path.dirname(os.path.abspath(out_path)), "_feat_cache")
     print(f"\nScanning: {maps_dir}")
+    print(f"Cache dir: {cache_dir}")
     candidates = scan_all_maps(maps_dir, max_maps)
     if not candidates:
         print("ERROR: No .osu files found."); sys.exit(1)
@@ -831,7 +957,7 @@ def train(maps_dir, out_path, max_maps, epochs):
             else:
                 continue
 
-        out = extract_features_and_labels(audio_path, groups, version_str)
+        out = extract_features_and_labels(audio_path, groups, version_str, cache_dir=cache_dir)
         feat_audio, hit_lbl, ln_lbl, ln_dur, pat_types, diff_level, ap = out
         if feat_audio is None:
             continue
@@ -859,8 +985,8 @@ def train(maps_dir, out_path, max_maps, epochs):
     sequences = build_cross_diff_context(raw_sequences)
 
     dataset = make_dataset(sequences)
-    loader  = DataLoader(dataset, batch_size=16, shuffle=True,
-                         num_workers=0, drop_last=True)
+    loader  = DataLoader(dataset, batch_size=32, shuffle=True,
+                         num_workers=0, pin_memory=True, drop_last=True)
     print(f"Dataset     : {len(dataset)} sequences x {SEQ_LEN} steps\n")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -868,15 +994,15 @@ def train(maps_dir, out_path, max_maps, epochs):
     model.to(device)
     params = sum(p.numel() for p in model.parameters())
 
-    print(f"Model       : ManiaTransformerV4  |  device: {device}  |  params: {params:,}")
+    print(f"Model       : ManiaCNNLSTM  |  device: {device}  |  params: {params:,}")
     print(f"Features    :")
     print(f"  mel({N_MEL}) + onset(1) + onset_harm(1) + onset_perc(1)")
     print(f"  + SC({N_SC}) + chroma({N_CHROMA}) + rms(1) + flatness(1)")
     print(f"  + centroid(1) + zcr(1) + phases_4scales(8)")
-    print(f"  = {FEAT_DIM_AUDIO} audio  +  {FEAT_DIM_CTX} ctx  =  {FEAT_DIM} total")
+    print(f"  = {FEAT_DIM_AUDIO} audio  +  {FEAT_DIM_CTX} ctx  +  {FEAT_DIM_COL_HIST} col_hist  =  {FEAT_DIM} total")
     print(f"Grid        : SUBDIV={SUBDIV}  |  4 difficulty heads  |  {NUM_PATTERNS} pattern classes")
-    print(f"Hyperparams : d_model={D_MODEL}  nhead={NHEAD}  layers={N_LAYERS}  "
-          f"ff={DIM_FF}  dropout={DROPOUT}\n")
+    print(f"Hyperparams : d_model={D_MODEL}  lstm_hidden={LSTM_HIDDEN}  "
+          f"lstm_layers={LSTM_LAYERS}  dropout={DROPOUT}\n")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=2e-4)
 
@@ -888,6 +1014,7 @@ def train(maps_dir, out_path, max_maps, epochs):
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     SIBLING_WEIGHT = 0.2
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
     history = {"total": [], "hit": [], "ln": [], "ln_dur": [], "pattern": [], "pat_acc": []}
     # Accumulate ground-truth pattern distribution once (first pass)
@@ -929,76 +1056,79 @@ def train(maps_dir, out_path, max_maps, epochs):
             diff      = diff.to(device)
 
             optimizer.zero_grad()
-            all_heads, pattern_logits = model(X, diff)
+            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                all_heads, pattern_logits = model(X, diff)
 
-            loss     = torch.tensor(0.0, device=device)
-            l_hit    = torch.tensor(0.0, device=device)
-            l_ln     = torch.tensor(0.0, device=device)
-            l_ln_dur = torch.tensor(0.0, device=device)
+                loss     = torch.tensor(0.0, device=device)
+                l_hit    = torch.tensor(0.0, device=device)
+                l_ln     = torch.tensor(0.0, device=device)
+                l_ln_dur = torch.tensor(0.0, device=device)
 
-            # ── Per-difficulty losses ──────────────────────────────────────────
-            for d in range(DIFF_LEVELS):
-                mask = (diff == d)
-                if not mask.any():
-                    continue
-
-                hit_logits, ln_logits, ln_dur = all_heads[d]
-
-                # 1. Hit placement loss with dynamic pos_weight
-                note_mean = y_hit[mask].mean().item()
-                pw_val    = min((1.0 - note_mean) / (note_mean + 1e-6), 15.0)
-                pw_val    = max(pw_val, 2.0)
-                pos_weight = torch.tensor([pw_val] * 4, device=device)
-
-                _lh = F.binary_cross_entropy_with_logits(
-                    hit_logits[mask], y_hit[mask], pos_weight=pos_weight)
-                loss = loss + _lh
-                l_hit = l_hit + _lh
-
-                # 2. LN classification loss on actual hit positions
-                hit_pos = y_hit[mask] > 0.5
-                if hit_pos.any():
-                    _ll = 0.4 * F.binary_cross_entropy_with_logits(
-                        ln_logits[mask][hit_pos], y_ln[mask][hit_pos])
-                    loss = loss + _ll
-                    l_ln = l_ln + _ll
-
-                # 3. LN duration regression on actual LN positions
-                ln_pos = y_ln[mask] > 0.5
-                if ln_pos.any():
-                    _ld = 0.15 * F.mse_loss(
-                        ln_dur[mask][ln_pos], y_ln_dur[mask][ln_pos])
-                    loss = loss + _ld
-                    l_ln_dur = l_ln_dur + _ld
-
-            # 4. Pattern type auxiliary loss (all samples, class-weighted)
-            l_pat = 0.25 * F.cross_entropy(
-                pattern_logits.reshape(-1, NUM_PATTERNS),
-                y_pattern.reshape(-1),
-                weight=pat_class_weights,
-            )
-            loss = loss + l_pat
-
-            # 5. Sibling diff auxiliary (hit loss only, weight=0.2)
-            if SIBLING_WEIGHT > 0:
+                # ── Per-difficulty losses ──────────────────────────────────────
                 for d in range(DIFF_LEVELS):
                     mask = (diff == d)
                     if not mask.any():
                         continue
+
+                    hit_logits, ln_logits, ln_dur = all_heads[d]
+
+                    # 1. Hit placement loss with dynamic pos_weight
                     note_mean  = y_hit[mask].mean().item()
                     pw_val     = min((1.0 - note_mean) / (note_mean + 1e-6), 15.0)
                     pw_val     = max(pw_val, 2.0)
                     pos_weight = torch.tensor([pw_val] * 4, device=device)
-                    for d2 in range(DIFF_LEVELS):
-                        if d2 == d:
-                            continue
-                        hit_logits2, _, _ = all_heads[d2]
-                        loss = loss + SIBLING_WEIGHT * F.binary_cross_entropy_with_logits(
-                            hit_logits2[mask], y_hit[mask], pos_weight=pos_weight)
 
-            loss.backward()
+                    _lh = F.binary_cross_entropy_with_logits(
+                        hit_logits[mask], y_hit[mask], pos_weight=pos_weight)
+                    loss  = loss + _lh
+                    l_hit = l_hit + _lh
+
+                    # 2. LN classification loss on actual hit positions
+                    hit_pos = y_hit[mask] > 0.5
+                    if hit_pos.any():
+                        _ll  = 0.4 * F.binary_cross_entropy_with_logits(
+                            ln_logits[mask][hit_pos], y_ln[mask][hit_pos])
+                        loss = loss + _ll
+                        l_ln = l_ln + _ll
+
+                    # 3. LN duration regression on actual LN positions
+                    ln_pos = y_ln[mask] > 0.5
+                    if ln_pos.any():
+                        _ld      = 0.15 * F.mse_loss(
+                            ln_dur[mask][ln_pos], y_ln_dur[mask][ln_pos])
+                        loss     = loss + _ld
+                        l_ln_dur = l_ln_dur + _ld
+
+                # 4. Pattern type auxiliary loss (all samples, class-weighted)
+                l_pat = 0.25 * F.cross_entropy(
+                    pattern_logits.reshape(-1, NUM_PATTERNS),
+                    y_pattern.reshape(-1),
+                    weight=pat_class_weights,
+                )
+                loss = loss + l_pat
+
+                # 5. Sibling diff auxiliary (hit loss only, weight=0.2)
+                if SIBLING_WEIGHT > 0:
+                    for d in range(DIFF_LEVELS):
+                        mask = (diff == d)
+                        if not mask.any():
+                            continue
+                        note_mean  = y_hit[mask].mean().item()
+                        pw_val     = min((1.0 - note_mean) / (note_mean + 1e-6), 15.0)
+                        pw_val     = max(pw_val, 2.0)
+                        pos_weight = torch.tensor([pw_val] * 4, device=device)
+                        for d2 in range(DIFF_LEVELS):
+                            if d2 == d:
+                                continue
+                            hit_logits2, _, _ = all_heads[d2]
+                            loss = loss + SIBLING_WEIGHT * F.binary_cross_entropy_with_logits(
+                                hit_logits2[mask], y_hit[mask], pos_weight=pos_weight)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             totals["total"]   += loss.item()
             totals["hit"]     += l_hit.item()
@@ -1057,22 +1187,23 @@ def train(maps_dir, out_path, max_maps, epochs):
                     col_balance[DIFF_NAMES[di]][col] += int(hit_pred[:, :, col].sum())
 
     torch.save({
-        "model_type":     "ManiaTransformerV4",
-        "feat_dim":       FEAT_DIM,
-        "feat_dim_audio": FEAT_DIM_AUDIO,
-        "feat_dim_ctx":   FEAT_DIM_CTX,
+        "model_type":        "ManiaCNNLSTM",
+        "feat_dim":          FEAT_DIM,
+        "feat_dim_audio":    FEAT_DIM_AUDIO,
+        "feat_dim_ctx":      FEAT_DIM_CTX,
+        "feat_dim_col_hist": FEAT_DIM_COL_HIST,
         "n_mel":          N_MEL,
         "n_sc":           N_SC,
         "n_chroma":       N_CHROMA,
         "subdiv":         SUBDIV,
         "d_model":        D_MODEL,
-        "nhead":          NHEAD,
-        "num_layers":     N_LAYERS,
-        "dim_ff":         DIM_FF,
+        "lstm_hidden":    LSTM_HIDDEN,
+        "lstm_layers":    LSTM_LAYERS,
         "diff_levels":    DIFF_LEVELS,
         "diff_emb":       DIFF_EMB,
         "dropout":        DROPOUT,
         "max_ln_beats":   MAX_LN_BEATS,
+        "num_patterns":   NUM_PATTERNS,
         "model_state":    model.state_dict(),
         "maps_trained":   len(sequences),
     }, out_path)
@@ -1207,12 +1338,12 @@ def save_training_report(history, conf_matrix, col_balance, out_path):
     ax.set_ylabel("%", color=DIM, fontsize=8)
     ax.legend(fontsize=8, facecolor=SURF, edgecolor="#3a2d62", labelcolor=DIM)
 
-    fig.suptitle("ManiaTransformerV4 — Training Report", color=PINK, fontsize=12, y=0.97)
+    fig.suptitle("ManiaCNNLSTM — Training Report", color=PINK, fontsize=12, y=0.97)
 
     report_path = os.path.splitext(out_path)[0] + "_training_report.png"
     plt.savefig(report_path, dpi=140, bbox_inches="tight", facecolor=BG)
     plt.close()
-    print(f"  Training report → {report_path}")
+    print(f"  Training report -> {report_path}")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

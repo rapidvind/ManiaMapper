@@ -17,28 +17,33 @@ KEYS   = 4
 COL_X  = [64, 192, 320, 448]
 
 DIFFICULTY_PRESETS = {
-    "Easy":   {"hp": 6, "od": 6,  "fill": 0.02,  "max_chord": 1},
-    "Normal": {"hp": 7, "od": 7,  "fill": 0.035, "max_chord": 2},
-    "Hard":   {"hp": 8, "od": 8,  "fill": 0.06,  "max_chord": 3},
-    "Insane": {"hp": 9, "od": 9,  "fill": 0.8,  "max_chord": 1},
+    "Easy":   {"hp": 6, "od": 6,  "fill": 0.04,  "max_chord": 1, "chord_fill": 0.00, "min_gap_col": 260},
+    "Normal": {"hp": 7, "od": 7,  "fill": 0.09,  "max_chord": 2, "chord_fill": 0.03, "min_gap_col": 200},
+    "Hard":   {"hp": 8, "od": 8,  "fill": 0.26,  "max_chord": 2, "chord_fill": 0.12, "min_gap_col": 130},
+    "Insane": {"hp": 9, "od": 9,  "fill": 0.55,  "max_chord": 3, "chord_fill": 0.20, "min_gap_col": 100},
 }
 
-MIN_GAP_SAME_COL_MS  = 80.0   # min ms between notes in the same column
+MIN_GAP_SAME_COL_MS  = 130.0  # min ms between notes in the same column (overridden per diff)
 MIN_GAP_DIFF_COL_MS  = 10.0   # guard against sub-16th timing bleed between columns
-MIN_GAP_AFTER_LN_MS  = 30.0   # min ms between LN release and next note in same column
+MIN_GAP_AFTER_LN_MS  = 50.0   # min ms between LN release and next note in same column
 _NN_SR            = 22050
 _NN_HOP           = 512
 _NN_SUBDIV        = 8          # 32nd-note inference grid (matches training SUBDIV)
 _NN_N_MEL         = 80
 _NN_N_SC          = 7
 _NN_N_CHROMA      = 12
-# V4 audio features: mel(80)+onset(1)+onset_harm(1)+onset_perc(1)+sc(7)+chroma(12)+
-#                    rms(1)+flat(1)+centroid(1)+zcr(1)+phases_4scales(8) = 114
-_NN_FEAT_DIM_AUDIO = 114
-_NN_FEAT_DIM_CTX  = 16         # zeros at inference (no sibling maps)
-_NN_FEAT_DIM      = _NN_FEAT_DIM_AUDIO + _NN_FEAT_DIM_CTX               # 130
+# Audio features: mel(80)+onset(1)+onset_harm(1)+onset_perc(1)+sc(7)+chroma(12)+
+#                 rms(1)+flat(1)+centroid(1)+zcr(1)+phases_4scales(8) = 114
+_NN_FEAT_DIM_AUDIO    = 114
+_NN_FEAT_DIM_CTX      = 16         # zeros at inference (no sibling maps)
+_NN_FEAT_DIM_COL_HIST = 16         # col history; zeros on pass1, real on pass2
+_NN_FEAT_DIM          = _NN_FEAT_DIM_AUDIO + _NN_FEAT_DIM_CTX + _NN_FEAT_DIM_COL_HIST  # 146
 _NN_MAX_LN_BEATS  = 16.0       # max LN duration in beats
 _NN_NUM_PATTERNS  = 18
+# CNN+BiLSTM defaults (ManiaCNNLSTM)
+_NN_D_MODEL       = 384
+_NN_LSTM_HIDDEN   = _NN_D_MODEL // 2   # bidirectional → output = D_MODEL
+_NN_LSTM_LAYERS   = 4
 
 DIFF_IDX = {"Easy": 0, "Normal": 1, "Hard": 2, "Insane": 3}
 
@@ -210,10 +215,12 @@ def analyze_audio(audio_path):
         return f
 
     feat_audio = np.stack([feat_at(t) for t in positions])   # (T, 114)
-    # Pad with zeros for cross-diff context (no sibling maps at inference)
+    # Pad ctx+col_hist with zeros (col_hist filled in by generate_notes two-pass)
     feat_full  = np.concatenate(
-        [feat_audio, np.zeros((len(positions), _NN_FEAT_DIM_CTX), dtype=np.float32)],
-        axis=1)                                                # (T, 130)
+        [feat_audio,
+         np.zeros((len(positions), _NN_FEAT_DIM_CTX + _NN_FEAT_DIM_COL_HIST),
+                  dtype=np.float32)],
+        axis=1)                                                # (T, 146)
 
     print(f"   BPM: {bpm_orig:.1f}  |  Grid steps: {len(positions)}")
     return dict(bpm_orig=bpm_orig, beat_length=beat_length, beat_times=beat_times,
@@ -226,9 +233,97 @@ def analyze_audio(audio_path):
 
 # ─── MODEL ───────────────────────────────────────────────────────────────────
 
-def _build_transformer(feat_dim, diff_levels, diff_emb, d_model, nhead,
-                        num_layers, dim_ff, dropout, max_ln_beats=16.0, num_patterns=9):
-    """Build ManiaTransformerV4 matching the trainer architecture."""
+def _build_cnn_lstm(feat_dim, diff_levels, diff_emb, d_model, lstm_hidden,
+                    lstm_layers, dropout, max_ln_beats=16.0, num_patterns=18):
+    """Build ManiaCNNLSTM — CNN front-end + BiLSTM backbone."""
+    import torch
+    import torch.nn as nn
+
+    class PatternConvBlock(nn.Module):
+        def __init__(self, d, drop=0.1):
+            super().__init__()
+            self.convs = nn.ModuleList([
+                nn.Sequential(
+                    nn.Conv1d(d, d, k, padding=k // 2, groups=d),
+                    nn.Conv1d(d, d, 1),
+                    nn.GELU(),
+                )
+                for k in [3, 5, 9, 13, 25]
+            ])
+            self.proj = nn.Linear(5 * d, d)
+            self.norm = nn.LayerNorm(d)
+            self.drop = nn.Dropout(drop)
+
+        def forward(self, x):
+            h = x.transpose(1, 2)
+            outs = [conv(h).transpose(1, 2) for conv in self.convs]
+            h = torch.cat(outs, dim=-1)
+            return self.norm(x + self.drop(self.proj(h)))
+
+    class DiffHead(nn.Module):
+        def __init__(self, d_in, drop=0.1):
+            super().__init__()
+            self.shared    = nn.Sequential(
+                nn.Linear(d_in, d_in // 2),
+                nn.GELU(),
+                nn.Dropout(drop),
+            )
+            self.hit_out    = nn.Linear(d_in // 2, 4)
+            self.ln_out     = nn.Linear(d_in // 2, 4)
+            self.ln_dur_out = nn.Linear(d_in // 2, 4)
+
+        def forward(self, h):
+            h2 = self.shared(h)
+            return (
+                self.hit_out(h2),
+                self.ln_out(h2),
+                torch.sigmoid(self.ln_dur_out(h2)) * max_ln_beats,
+            )
+
+    class ManiaCNNLSTM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.diff_emb   = nn.Embedding(diff_levels, diff_emb)
+            self.input_proj = nn.Linear(feat_dim + diff_emb, d_model)
+            self.conv1      = PatternConvBlock(d_model, drop=dropout)
+            self.conv2      = PatternConvBlock(d_model, drop=dropout)
+            self.lstm       = nn.LSTM(
+                input_size=d_model,
+                hidden_size=lstm_hidden,
+                num_layers=lstm_layers,
+                batch_first=True,
+                bidirectional=True,
+                dropout=dropout if lstm_layers > 1 else 0.0,
+            )
+            self.lstm_norm  = nn.LayerNorm(d_model)
+            self.pattern_head = nn.Sequential(
+                nn.Linear(d_model, d_model // 4),
+                nn.GELU(),
+                nn.Linear(d_model // 4, num_patterns),
+            )
+            self.heads = nn.ModuleList([
+                DiffHead(d_model, drop=dropout)
+                for _ in range(diff_levels)
+            ])
+
+        def forward(self, x, diff):
+            B, T, _ = x.shape
+            d = self.diff_emb(diff).unsqueeze(1).expand(B, T, -1)
+            h = self.input_proj(torch.cat([x, d], dim=-1))
+            h = self.conv1(h)
+            h = self.conv2(h)
+            lstm_out, _ = self.lstm(h)
+            h = self.lstm_norm(h + lstm_out)
+            pattern_logits = self.pattern_head(h)
+            head_outputs   = [head(h) for head in self.heads]
+            return head_outputs, pattern_logits
+
+    return ManiaCNNLSTM()
+
+
+def _build_transformer_v4(feat_dim, diff_levels, diff_emb, d_model, nhead,
+                           num_layers, dim_ff, dropout, max_ln_beats=16.0, num_patterns=9):
+    """Legacy builder — loads old ManiaTransformerV4 checkpoints."""
     import torch
     import torch.nn as nn
     import math
@@ -320,7 +415,7 @@ def _build_transformer(feat_dim, diff_levels, diff_emb, d_model, nhead,
             h = self.norm(h)
             pattern_logits = self.pattern_head(h)
             head_outputs   = [head(h) for head in self.heads]
-            return head_outputs, pattern_logits   # matches trainer output
+            return head_outputs, pattern_logits
 
     return ManiaTransformerV4()
 
@@ -333,30 +428,283 @@ def load_nn_model(model_path):
     try:
         ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
 
-        # Read hyperparams saved by trainer (with V4 defaults)
         feat_dim     = ckpt.get("feat_dim",      _NN_FEAT_DIM)
         diff_levels  = ckpt.get("diff_levels",   4)
         diff_emb     = ckpt.get("diff_emb",      32)
-        d_model      = ckpt.get("d_model",       384)
-        nhead        = ckpt.get("nhead",         8)
-        num_layers   = ckpt.get("num_layers",    6)
-        dim_ff       = ckpt.get("dim_ff",        1536)
+        d_model      = ckpt.get("d_model",       _NN_D_MODEL)
         dropout      = ckpt.get("dropout",       0.20)
         max_ln_beats = ckpt.get("max_ln_beats",  _NN_MAX_LN_BEATS)
         num_patterns = ckpt.get("num_patterns",  _NN_NUM_PATTERNS)
+        model_type   = ckpt.get("model_type",    "ManiaCNNLSTM")
 
-        model_type = ckpt.get("model_type", "ManiaTransformerV4")
-        if "V4" not in model_type:
-            print(f"   [warn] Checkpoint type '{model_type}' — retrain with ManiaNNTrainer.py for V4 features")
+        if model_type == "ManiaCNNLSTM":
+            lstm_hidden = ckpt.get("lstm_hidden", _NN_LSTM_HIDDEN)
+            lstm_layers = ckpt.get("lstm_layers", _NN_LSTM_LAYERS)
+            m = _build_cnn_lstm(feat_dim, diff_levels, diff_emb, d_model,
+                                lstm_hidden, lstm_layers, dropout,
+                                max_ln_beats=max_ln_beats, num_patterns=num_patterns)
+        else:
+            # Legacy ManiaTransformerV4 checkpoint
+            print(f"   [info] Loading legacy transformer checkpoint ({model_type})")
+            nhead      = ckpt.get("nhead",      8)
+            num_layers = ckpt.get("num_layers", 6)
+            dim_ff     = ckpt.get("dim_ff",     1536)
+            m = _build_transformer_v4(feat_dim, diff_levels, diff_emb,
+                                      d_model, nhead, num_layers, dim_ff, dropout,
+                                      max_ln_beats=max_ln_beats, num_patterns=num_patterns)
 
-        m = _build_transformer(feat_dim, diff_levels, diff_emb,
-                               d_model, nhead, num_layers, dim_ff, dropout,
-                               max_ln_beats=max_ln_beats, num_patterns=num_patterns)
         m.load_state_dict(ckpt["model_state"])
         m.eval()
         return {"model": m, "meta": ckpt, "max_ln_beats": max_ln_beats}
     except Exception as e:
         print(f"   [warn] Could not load model: {e}"); return None
+
+
+# ─── DENSITY FLOOR ───────────────────────────────────────────────────────────
+
+def _fill_sparse_windows(notes, all_prob, positions):
+    """Inject notes to break up any gap > MAX_GAP_MS between consecutive notes.
+    Notes are distributed evenly across the gap, each placed at the highest-probability
+    grid position within a search window around its ideal time.
+    """
+    if not notes or all_prob is None or not positions:
+        return notes
+
+    import bisect, math
+
+    MAX_GAP_MS  = 900    # max allowed consecutive silence (~2.5 beats at 172 BPM)
+    SEARCH_HALF = 400    # ms either side of ideal injection time to find a grid position
+
+    notes    = list(sorted(notes, key=lambda n: n[0]))
+    note_set = {(n[0], n[1]) for n in notes}
+    col_times = {c: sorted(n[0] for n in notes if n[1] == c) for c in range(KEYS)}
+    pos_t     = [float(p) for p in positions]
+
+    # Build LN ranges per column so injected notes never land inside a hold
+    ln_ranges = {c: [] for c in range(KEYS)}
+    for nt, nc, is_ln, ln_end in notes:
+        if is_ln and ln_end > nt:
+            ln_ranges[nc].append((nt, ln_end))
+
+    def inside_ln(col, t):
+        return any(s <= t <= e for s, e in ln_ranges[col])
+
+    def gap_ok(col, t):
+        if inside_ln(col, t):
+            return False
+        ct  = col_times[col]
+        idx = bisect.bisect_left(ct, t)
+        if idx < len(ct) and ct[idx] - t < MIN_GAP_SAME_COL_MS:
+            return False
+        if idx > 0 and t - ct[idx - 1] < MIN_GAP_SAME_COL_MS:
+            return False
+        return True
+
+    def best_near(ideal_t):
+        lo = bisect.bisect_left(pos_t, ideal_t - SEARCH_HALF)
+        hi = bisect.bisect_right(pos_t, ideal_t + SEARCH_HALF)
+        best_p, best_rt, best_col = -1.0, None, None
+        for pi in range(lo, hi):
+            pt = pos_t[pi]
+            for col in sorted(range(KEYS), key=lambda c: -float(all_prob[pi, c])):
+                if (round(pt), col) in note_set:
+                    continue
+                if not gap_ok(col, pt):
+                    continue
+                p = float(all_prob[pi, col])
+                if p > best_p:
+                    best_p, best_rt, best_col = p, round(pt), col
+                break  # take best col for this position and move on
+        return best_rt, best_col
+
+    # Work on the accumulated note-time list so injected notes update future gap checks
+    injected      = []
+    all_note_times = sorted(set(n[0] for n in notes))  # unique note timestamps (any col)
+
+    changed = True
+    while changed:
+        changed = False
+        i = 0
+        while i < len(all_note_times) - 1:
+            t1  = all_note_times[i]
+            t2  = all_note_times[i + 1]
+            gap = t2 - t1
+            if gap > MAX_GAP_MS:
+                needed = math.ceil(gap / MAX_GAP_MS) - 1
+                for k in range(1, needed + 1):
+                    ideal_t = t1 + k * gap / (needed + 1)
+                    rt, col = best_near(ideal_t)
+                    if rt is not None and col is not None and rt not in all_note_times:
+                        injected.append((rt, col, False, 0))
+                        note_set.add((rt, col))
+                        bisect.insort(col_times[col], float(rt))
+                        bisect.insort(all_note_times, rt)
+                        changed = True
+            i += 1
+
+    if injected:
+        notes = sorted(notes + injected, key=lambda n: n[0])
+    return notes
+
+
+# ─── PATTERN DIVERSIFIER ─────────────────────────────────────────────────────
+
+def _diversify_patterns(notes):
+    """Post-process: swap column assignments to break over-repeated 3-note patterns.
+    Each pass targets the single worst offender; recomputes after each swap so
+    verification is always against current state."""
+    from collections import Counter
+    import bisect
+
+    PATTERN_BUDGET = 14
+    MAX_PASSES     = 120  # enough passes to drive all patterns down
+
+    notes = list(sorted(notes, key=lambda n: n[0]))
+    time_counts = Counter(n[0] for n in notes)
+    chord_times = {t for t, cnt in time_counts.items() if cnt > 1}
+
+    col_times = {c: sorted(n[0] for n in notes if n[1] == c) for c in range(KEYS)}
+
+    # Build LN ranges so we never swap a solo note into a column mid-hold
+    ln_ranges = {c: [] for c in range(KEYS)}
+    for nt, nc, is_ln, ln_end in notes:
+        if is_ln and ln_end > nt:
+            ln_ranges[nc].append((nt, ln_end))
+
+    def inside_ln(col, t):
+        return any(s <= t <= e for s, e in ln_ranges[col])
+
+    def gap_ok(col, t):
+        if inside_ln(col, t):
+            return False
+        ts = col_times[col]
+        ix = bisect.bisect_left(ts, t)
+        if ix < len(ts) and ts[ix] - t < MIN_GAP_SAME_COL_MS:
+            return False
+        if ix > 0 and t - ts[ix - 1] < MIN_GAP_SAME_COL_MS:
+            return False
+        return True
+
+    # Don't attempt to move LN notes
+    ln_times = {n[0] for n in notes if n[2]}
+
+    for _ in range(MAX_PASSES):
+        cols = [n[1] for n in notes]
+        nn   = len(cols)
+
+        tg_counter = Counter(tuple(cols[k:k+3]) for k in range(nn - 2))
+        worst_pattern, worst_cnt = max(tg_counter.items(), key=lambda x: x[1])
+        if worst_cnt <= PATTERN_BUDGET:
+            break
+
+        c1, c2, c3 = worst_pattern
+        # Scan for occurrences past the budget limit (skip chord-spanning patterns)
+        swapped = 0
+        budget_seen = 0
+        for k in range(nn - 2):
+            if notes[k][1] != c1 or notes[k+1][1] != c2 or notes[k+2][1] != c3:
+                continue
+            # Skip chord-spanning and LN notes
+            if notes[k][0] == notes[k+1][0] or notes[k+1][0] == notes[k+2][0]:
+                continue
+            if notes[k+2][2]:  # is_ln — don't move LN notes
+                continue
+            if notes[k+2][0] in ln_times:
+                continue
+            budget_seen += 1
+            if budget_seen <= PATTERN_BUDGET:
+                continue
+            t = notes[k + 2][0]
+            if t in chord_times:
+                continue
+            candidates = []
+            for new_col in range(KEYS):
+                if new_col == c3:
+                    continue
+                if gap_ok(new_col, t):
+                    new_tg_cnt = tg_counter.get((c1, c2, new_col), 0)
+                    candidates.append((new_tg_cnt, new_col))
+            if not candidates:
+                continue
+            candidates.sort()
+            best_new_col = candidates[0][1]
+            col_times[c3].remove(t)
+            notes[k + 2] = (t, best_new_col, notes[k+2][2], notes[k+2][3])
+            bisect.insort(col_times[best_new_col], t)
+            tg_counter[worst_pattern] -= 1
+            tg_counter[(c1, c2, best_new_col)] = tg_counter.get((c1, c2, best_new_col), 0) + 1
+            swapped += 1
+
+        if swapped == 0:
+            break  # can't improve further (all excess occurrences are chord/constrained)
+
+    return notes
+
+
+# ─── COLUMN REBALANCER ───────────────────────────────────────────────────────
+
+def _rebalance_columns(notes):
+    """Aggressively redistribute column assignments to equalise column counts.
+    Targets ±8% of 25% per column. Only moves solo notes; respects MIN_GAP_SAME_COL_MS."""
+    if not notes:
+        return notes
+
+    import collections, bisect
+    notes = list(sorted(notes, key=lambda n: n[0]))
+    target = len(notes) / KEYS
+
+    def gap_ok(times_sorted, t):
+        idx = bisect.bisect_left(times_sorted, t)
+        if idx < len(times_sorted) and times_sorted[idx] - t < MIN_GAP_SAME_COL_MS:
+            return False
+        if idx > 0 and t - times_sorted[idx - 1] < MIN_GAP_SAME_COL_MS:
+            return False
+        return True
+
+    col_times = {c: sorted(n[0] for n in notes if n[1] == c) for c in range(KEYS)}
+    col_counts = collections.Counter(n[1] for n in notes)
+
+    # build a set of time positions that are chords (multiple notes at same time)
+    time_counts = collections.Counter(n[0] for n in notes)
+    chord_times = {t for t, cnt in time_counts.items() if cnt > 1}
+
+    changed = True
+    passes = 0
+    while changed and passes < 10:
+        changed = False
+        passes += 1
+        over  = sorted([c for c in range(KEYS) if col_counts[c] > target * 1.08], key=lambda c: -col_counts[c])
+        under = sorted([c for c in range(KEYS) if col_counts[c] < target * 0.92], key=lambda c:  col_counts[c])
+        if not over or not under:
+            break
+
+        for i, note in enumerate(notes):
+            t, col, is_ln, ln_end = note
+            if col not in over:
+                continue
+            if t in chord_times:
+                continue  # never move chord notes
+            if is_ln:
+                continue  # never move LN notes
+
+            # try each under-represented column, prefer least-used first
+            for dst in under:
+                if dst == col:
+                    continue
+                if gap_ok(col_times[dst], t):
+                    # move note
+                    notes[i] = (t, dst, is_ln, ln_end)
+                    col_times[col].remove(t)
+                    bisect.insort(col_times[dst], t)
+                    col_counts[col] -= 1
+                    col_counts[dst] += 1
+                    changed = True
+                    # refresh over/under after each move
+                    over  = sorted([c for c in range(KEYS) if col_counts[c] > target * 1.08], key=lambda c: -col_counts[c])
+                    under = sorted([c for c in range(KEYS) if col_counts[c] < target * 0.92], key=lambda c:  col_counts[c])
+                    break
+
+    return notes
 
 
 # ─── NOTE GENERATION ─────────────────────────────────────────────────────────
@@ -371,102 +719,199 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord
     max_ln_beats = nn_model_data.get("max_ln_beats", _NN_MAX_LN_BEATS)
     beat_length  = audio_data["beat_length"]
     device       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Per-difficulty same-column gap (overrides global MIN_GAP_SAME_COL_MS)
+    min_gap_col = float(DIFFICULTY_PRESETS.get(difficulty, {}).get("min_gap_col", MIN_GAP_SAME_COL_MS))
     model.to(device)
     model.eval()
 
     positions = audio_data["positions"]
-    feat_full = audio_data["feat_full"]       # (T, 130) — pre-computed in analyze_audio
+    feat_full = audio_data["feat_full"].copy()  # (T, 146) — will modify col_hist dims for pass2
     diff_idx  = DIFF_IDX.get(difficulty, 2)
 
     if not positions:
         return [], {"all_prob": np.zeros((0, 4)), "positions": [], "threshold": 0.5}
 
-    T          = len(positions)
-    all_prob       = np.zeros((T, KEYS),              dtype=np.float32)
-    all_ln_p       = np.zeros((T, KEYS),              dtype=np.float32)
-    all_ln_dur     = np.zeros((T, KEYS),              dtype=np.float32)
-    all_pat_logits = np.zeros((T, _NN_NUM_PATTERNS),  dtype=np.float32)
-    diff_t     = torch.tensor([diff_idx], dtype=torch.long).to(device)
+    T = len(positions)
+    meta = nn_model_data.get("meta", {})
+    # Clip or pad feat_full to model's expected feat_dim (backward compat with 130-dim models)
+    model_feat_dim = meta.get("feat_dim", _NN_FEAT_DIM)
+    if feat_full.shape[1] != model_feat_dim:
+        if feat_full.shape[1] > model_feat_dim:
+            feat_full = feat_full[:, :model_feat_dim].copy()
+        else:
+            pad = np.zeros((T, model_feat_dim - feat_full.shape[1]), dtype=np.float32)
+            feat_full = np.concatenate([feat_full, pad], axis=1)
+    use_col_hist = meta.get("feat_dim_col_hist", 0) > 0
     CHUNK, OVERLAP = 512, 64
 
-    with torch.no_grad():
-        i = 0
-        while i < T:
-            j = min(i + CHUNK, T)
-            x = torch.tensor(feat_full[i:j], dtype=torch.float32).unsqueeze(0).to(device)
-            d = diff_t.expand(x.size(0))
-            head_outputs, pat_logits = model(x, d)   # capture pattern logits
-            hit_logits, ln_logits, ln_dur = head_outputs[diff_idx]
-            all_prob[i:j]       = torch.sigmoid(hit_logits)[0].cpu().numpy()
-            all_ln_p[i:j]       = torch.sigmoid(ln_logits)[0].cpu().numpy()
-            all_ln_dur[i:j]     = ln_dur[0].cpu().numpy()
-            all_pat_logits[i:j] = pat_logits[0].cpu().numpy()
-            i = j - OVERLAP if j < T else T
+    def run_model_pass(ff):
+        ap  = np.zeros((T, KEYS),             dtype=np.float32)
+        alp = np.zeros((T, KEYS),             dtype=np.float32)
+        ald = np.zeros((T, KEYS),             dtype=np.float32)
+        apl = np.zeros((T, _NN_NUM_PATTERNS), dtype=np.float32)
+        dt  = torch.tensor([diff_idx], dtype=torch.long).to(device)
+        with torch.no_grad():
+            i = 0
+            while i < T:
+                j = min(i + CHUNK, T)
+                x = torch.tensor(ff[i:j], dtype=torch.float32).unsqueeze(0).to(device)
+                d = dt.expand(x.size(0))
+                head_outputs, pat_logits = model(x, d)
+                hit_logits, ln_logits, ln_dur = head_outputs[diff_idx]
+                ap[i:j]  = torch.sigmoid(hit_logits)[0].cpu().numpy()
+                alp[i:j] = torch.sigmoid(ln_logits)[0].cpu().numpy()
+                ald[i:j] = ln_dur[0].cpu().numpy()
+                apl[i:j] = pat_logits[0].cpu().numpy()
+                i = j - OVERLAP if j < T else T
+        return ap, alp, ald, apl
 
-    # threshold from fill%
-    threshold = float(np.percentile(all_prob, (1.0 - fill) * 100))
+    # ── Pass 1: zero col history (feat_full already zeroed) ──────────────────
+    all_prob, all_ln_p, all_ln_dur, all_pat_logits = run_model_pass(feat_full)
 
-    # time-ordered placement — model's hit_logits drive everything.
-    # The shared transformer backbone has already learned audio→pattern context,
-    # so hit probabilities implicitly encode what pattern belongs here.
-    # We add only one safeguard: if greedy selection produces 10+ consecutive
-    # steps alternating between the same 2 columns, gently dampen those columns
-    # so the model isn't stuck in a degenerate loop (this is a per-column
-    # probability artifact, not a pattern-learning issue).
+    if use_col_hist:
+        # Greedy pass1 placements — lightweight, just need column sequence
+        chord_fill1  = float(DIFFICULTY_PRESETS.get(difficulty, {}).get("chord_fill", 0.12))
+        ROLL_WIN1    = _NN_SUBDIV * 8
+        thr1 = np.zeros(T, dtype=np.float32)
+        cthr1 = np.zeros(T, dtype=np.float32)
+        for i in range(T):
+            lo = max(0, i - ROLL_WIN1); hi = min(T, i + ROLL_WIN1 + 1)
+            w = all_prob[lo:hi]
+            thr1[i]  = float(np.percentile(w, (1.0 - fill) * 100))
+            cthr1[i] = float(np.percentile(w, (1.0 - chord_fill1) * 100))
+
+        p1_col_last   = {c: -9999.0 for c in range(KEYS)}
+        p1_col_counts = [0] * KEYS
+        p1_ln_end_by_col = {c: -9999.0 for c in range(KEYS)}
+        placed_at_step = [[] for _ in range(T)]   # cols placed at each timestep
+
+        for i, t in enumerate(positions):
+            total_placed = sum(p1_col_counts) + 1
+            avg_per_col  = total_placed / KEYS
+            eligible = []
+            for col in range(KEYS):
+                p = float(all_prob[i, col])
+                if t < p1_ln_end_by_col[col] + MIN_GAP_AFTER_LN_MS:
+                    continue
+                if not (p >= thr1[i] and t - p1_col_last[col] >= min_gap_col):
+                    continue
+                if any(t - p1_col_last[c] < MIN_GAP_DIFF_COL_MS for c in range(KEYS) if c != col):
+                    continue
+                if p1_col_counts[col] > avg_per_col * 1.4 and avg_per_col > 2:
+                    continue
+                bal = min(max(avg_per_col / max(p1_col_counts[col], 1), 0.25), 4.0)
+                eligible.append((p * bal, col))
+            eligible.sort(reverse=True)
+            to_place = eligible[:1]
+            for _, col in eligible[1:max_chord]:
+                if float(all_prob[i, col]) >= cthr1[i]:
+                    to_place.append((_, col))
+            for _, col in to_place:
+                p_ln = float(all_ln_p[i, col])
+                if p_ln > 0.35:
+                    dur_beats = max(float(all_ln_dur[i, col]), 1.0)
+                    p1_ln_end_by_col[col] = round(t + dur_beats * beat_length)
+                p1_col_last[col] = t
+                p1_col_counts[col] += 1
+                placed_at_step[i].append(col)
+
+        # Build col history from pass1 placements
+        col_hist = np.zeros((T, _NN_FEAT_DIM_COL_HIST), dtype=np.float32)
+        recent = []
+        for i in range(T):
+            n = len(recent)
+            for k in range(min(n, 4)):
+                c = recent[n - 1 - k]
+                col_hist[i, k * 4 + c] = 1.0
+            for c in placed_at_step[i]:
+                recent.append(c)
+
+        # Inject col history into feat_full (last 16 dims) and re-run
+        feat_full[:, -_NN_FEAT_DIM_COL_HIST:] = col_hist
+        all_prob, all_ln_p, all_ln_dur, all_pat_logits = run_model_pass(feat_full)
+
+    # Rolling per-timestep threshold over a ±8-beat window so the model's
+    # probabilities are judged relative to the local section, not the whole song.
+    # This lets the model's learned density variation drive note placement —
+    # quiet intro sections naturally place fewer notes, active sections more,
+    # without a single global cutoff flattening everything.
+    chord_fill  = float(DIFFICULTY_PRESETS.get(difficulty, {}).get("chord_fill", 0.12))
+    ROLL_WIN    = _NN_SUBDIV * 8   # ±8 beats
+    thresholds  = np.zeros(T, dtype=np.float32)
+    c_thresholds = np.zeros(T, dtype=np.float32)
+    for i in range(T):
+        lo = max(0, i - ROLL_WIN)
+        hi = min(T, i + ROLL_WIN + 1)
+        window = all_prob[lo:hi]
+        thresholds[i]   = float(np.percentile(window, (1.0 - fill)       * 100))
+        c_thresholds[i] = float(np.percentile(window, (1.0 - chord_fill) * 100))
+    threshold = float(np.median(thresholds))   # representative value for analysis output
+
+    # Greedy time-ordered placement driven by the model's per-column probabilities.
+    # The CNN+BiLSTM backbone learns pattern structure from training data, so only
+    # physical constraints (timing gaps, balance) and a mild flow preference are kept
+    # here — the aggressive manual pattern dampening from the old transformer path
+    # is no longer needed.
     from collections import deque
     col_last      = {c: -9999.0 for c in range(KEYS)}
     col_counts    = [0] * KEYS
     placed        = []
     ln_end_by_col = {c: -9999.0 for c in range(KEYS)}
-    recent_cols   = deque(maxlen=10)  # track last 10 placed single-note cols
+    recent_cols   = deque(maxlen=4)   # only needed for adjacent-flow preference
 
     for i, t in enumerate(positions):
         total_placed = sum(col_counts) + 1
         avg_per_col  = total_placed / KEYS
 
-        # ── degenerate-trill guard ────────────────────────────────────────────
-        # Only kicks in after 10 consecutive alternating steps between 2 cols.
-        rc = list(recent_cols)
-        trill_cols = set()
-        if len(rc) >= 10:
-            unique10 = set(rc[-10:])
-            if len(unique10) == 2:
-                if all(rc[-10:][k] != rc[-10:][k + 1] for k in range(9)):
-                    trill_cols = unique10   # these two cols are stuck looping
+        # ── flow preference: gently boost adjacent-column transitions ─────────
+        flow_boost = {}
+        if recent_cols:
+            last_c = recent_cols[-1]
+            for c in range(KEYS):
+                dist = abs(c - last_c)
+                flow_boost[c] = 1.20 if dist == 1 else (0.75 if dist == 3 else 1.0)
 
         eligible = []
         for col in range(KEYS):
             p = float(all_prob[i, col])
             if t < ln_end_by_col[col] + MIN_GAP_AFTER_LN_MS:
                 continue
-            if not (p >= threshold and t - col_last[col] >= MIN_GAP_SAME_COL_MS):
+            if not (p >= thresholds[i] and t - col_last[col] >= min_gap_col):
                 continue
             if any(t - col_last[c] < MIN_GAP_DIFF_COL_MS for c in range(KEYS) if c != col):
                 continue
-
-            bal = avg_per_col / max(col_counts[col], 1)
-            bal = min(max(bal, 0.25), 4.0)
-
-            # gentle dampen only when stuck in degenerate 10-step trill loop
-            dampen = 0.4 if col in trill_cols else 1.0
-
-            eligible.append((p * bal * dampen, col))
+            # Hard balance cap: skip if column has >40% more notes than average
+            if col_counts[col] > avg_per_col * 1.4 and avg_per_col > 2:
+                continue
+            bal = min(max(avg_per_col / max(col_counts[col], 1), 0.25), 4.0)
+            eligible.append((p * bal * flow_boost.get(col, 1.0), col))
 
         eligible.sort(reverse=True)
-        for _, col in eligible[:max_chord]:
+        # Chord notes require higher raw probability
+        notes_to_place = eligible[:1]
+        for _, col in eligible[1:max_chord]:
+            if float(all_prob[i, col]) >= c_thresholds[i]:
+                notes_to_place.append((_, col))
+
+        primary_col = notes_to_place[0][1] if notes_to_place else None
+        for _, col in notes_to_place:
             p_ln = float(all_ln_p[i, col])
-            if p_ln > 0.5:
-                dur_beats = float(all_ln_dur[i, col])
-                dur_beats = max(dur_beats, 1.0)
+            if p_ln > 0.35:
+                dur_beats = max(float(all_ln_dur[i, col]), 1.0)
                 ln_end_ms = round(t + dur_beats * beat_length)
                 placed.append((round(t), col, True, ln_end_ms))
                 ln_end_by_col[col] = ln_end_ms
             else:
                 placed.append((round(t), col, False, 0))
-                recent_cols.append(col)
             col_last[col]    = t
             col_counts[col] += 1
+        if primary_col is not None:
+            recent_cols.append(primary_col)
 
+    placed = _fill_sparse_windows(placed, all_prob, positions)
+    placed = _diversify_patterns(placed)
+    placed = _rebalance_columns(placed)
     return placed, {"all_prob": all_prob, "positions": positions, "threshold": threshold}
 
 
@@ -659,8 +1104,8 @@ def save_analysis(notes, analysis, audio_data, settings, output_dir):
     with open(json_path, "w", encoding="utf-8") as f:
         _json.dump(stats, f, indent=2)
 
-    print(f"   Analysis PNG  → {png_path}")
-    print(f"   Analysis JSON → {json_path}")
+    print(f"   Analysis PNG  -> {png_path}")
+    print(f"   Analysis JSON -> {json_path}")
 
 
 # ─── SV ──────────────────────────────────────────────────────────────────────
