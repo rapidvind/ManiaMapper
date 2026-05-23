@@ -17,10 +17,10 @@ KEYS   = 4
 COL_X  = [64, 192, 320, 448]
 
 DIFFICULTY_PRESETS = {
-    "Easy":   {"hp": 6, "od": 6,  "fill": 0.04,  "max_chord": 1, "chord_fill": 0.00, "min_gap_col": 260},
-    "Normal": {"hp": 7, "od": 7,  "fill": 0.09,  "max_chord": 2, "chord_fill": 0.03, "min_gap_col": 200},
-    "Hard":   {"hp": 8, "od": 8,  "fill": 0.26,  "max_chord": 2, "chord_fill": 0.12, "min_gap_col": 130},
-    "Insane": {"hp": 9, "od": 9,  "fill": 0.55,  "max_chord": 3, "chord_fill": 0.20, "min_gap_col": 100},
+    "Easy":   {"hp": 6, "od": 6,  "fill": 0.04,  "max_chord": 1, "chord_fill": 0.00, "min_gap_col": 260, "target_nps": 2.5},
+    "Normal": {"hp": 7, "od": 7,  "fill": 0.09,  "max_chord": 2, "chord_fill": 0.03, "min_gap_col": 200, "target_nps": 4.5},
+    "Hard":   {"hp": 8, "od": 8,  "fill": 0.42,  "max_chord": 2, "chord_fill": 0.20, "min_gap_col": 80,  "target_nps": 9.5},
+    "Insane": {"hp": 9, "od": 9,  "fill": 0.65,  "max_chord": 3, "chord_fill": 0.28, "min_gap_col": 60,  "target_nps": 16.0},
 }
 
 MIN_GAP_SAME_COL_MS  = 130.0  # min ms between notes in the same column (overridden per diff)
@@ -102,6 +102,9 @@ def analyze_audio(audio_path):
     tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
     beat_times  = librosa.frames_to_time(beat_frames, sr=sr) * 1000
     bpm_orig    = float(np.atleast_1d(tempo)[0])
+    # librosa often halves the true BPM for fast songs; double it if it looks half-time
+    if bpm_orig < 100:
+        bpm_orig *= 2
     beat_length = 60000.0 / bpm_orig
     duration_ms = len(y) / sr * 1000
     hop         = _NN_HOP
@@ -462,7 +465,7 @@ def load_nn_model(model_path):
 
 # ─── DENSITY FLOOR ───────────────────────────────────────────────────────────
 
-def _fill_sparse_windows(notes, all_prob, positions):
+def _fill_sparse_windows(notes, all_prob, positions, min_gap_col=None):
     """Inject notes to break up any gap > MAX_GAP_MS between consecutive notes.
     Notes are distributed evenly across the gap, each placed at the highest-probability
     grid position within a search window around its ideal time.
@@ -472,6 +475,7 @@ def _fill_sparse_windows(notes, all_prob, positions):
 
     import bisect, math
 
+    _min_gap    = min_gap_col if min_gap_col is not None else MIN_GAP_SAME_COL_MS
     MAX_GAP_MS  = 900    # max allowed consecutive silence (~2.5 beats at 172 BPM)
     SEARCH_HALF = 400    # ms either side of ideal injection time to find a grid position
 
@@ -494,9 +498,9 @@ def _fill_sparse_windows(notes, all_prob, positions):
             return False
         ct  = col_times[col]
         idx = bisect.bisect_left(ct, t)
-        if idx < len(ct) and ct[idx] - t < MIN_GAP_SAME_COL_MS:
+        if idx < len(ct) and ct[idx] - t < _min_gap:
             return False
-        if idx > 0 and t - ct[idx - 1] < MIN_GAP_SAME_COL_MS:
+        if idx > 0 and t - ct[idx - 1] < _min_gap:
             return False
         return True
 
@@ -549,13 +553,14 @@ def _fill_sparse_windows(notes, all_prob, positions):
 
 # ─── PATTERN DIVERSIFIER ─────────────────────────────────────────────────────
 
-def _diversify_patterns(notes):
+def _diversify_patterns(notes, min_gap_col=None):
     """Post-process: swap column assignments to break over-repeated 3-note patterns.
     Each pass targets the single worst offender; recomputes after each swap so
     verification is always against current state."""
     from collections import Counter
     import bisect
 
+    _min_gap       = min_gap_col if min_gap_col is not None else MIN_GAP_SAME_COL_MS
     PATTERN_BUDGET = 14
     MAX_PASSES     = 120  # enough passes to drive all patterns down
 
@@ -579,9 +584,9 @@ def _diversify_patterns(notes):
             return False
         ts = col_times[col]
         ix = bisect.bisect_left(ts, t)
-        if ix < len(ts) and ts[ix] - t < MIN_GAP_SAME_COL_MS:
+        if ix < len(ts) and ts[ix] - t < _min_gap:
             return False
-        if ix > 0 and t - ts[ix - 1] < MIN_GAP_SAME_COL_MS:
+        if ix > 0 and t - ts[ix - 1] < _min_gap:
             return False
         return True
 
@@ -643,21 +648,33 @@ def _diversify_patterns(notes):
 
 # ─── COLUMN REBALANCER ───────────────────────────────────────────────────────
 
-def _rebalance_columns(notes):
+def _rebalance_columns(notes, min_gap_col=None):
     """Aggressively redistribute column assignments to equalise column counts.
-    Targets ±8% of 25% per column. Only moves solo notes; respects MIN_GAP_SAME_COL_MS."""
+    Targets ±8% of 25% per column. Only moves solo notes; respects min_gap_col."""
     if not notes:
         return notes
 
     import collections, bisect
+    _min_gap = min_gap_col if min_gap_col is not None else MIN_GAP_SAME_COL_MS
     notes = list(sorted(notes, key=lambda n: n[0]))
     target = len(notes) / KEYS
 
-    def gap_ok(times_sorted, t):
-        idx = bisect.bisect_left(times_sorted, t)
-        if idx < len(times_sorted) and times_sorted[idx] - t < MIN_GAP_SAME_COL_MS:
+    # Build LN ranges per column so we never move a note into a column mid-hold
+    ln_ranges = {c: [] for c in range(KEYS)}
+    for nt, nc, is_ln, ln_end in notes:
+        if is_ln and ln_end > nt:
+            ln_ranges[nc].append((nt, ln_end))
+
+    def inside_ln(col, t):
+        return any(s <= t <= e for s, e in ln_ranges[col])
+
+    def gap_ok(col, times_sorted, t):
+        if inside_ln(col, t):
             return False
-        if idx > 0 and t - times_sorted[idx - 1] < MIN_GAP_SAME_COL_MS:
+        idx = bisect.bisect_left(times_sorted, t)
+        if idx < len(times_sorted) and times_sorted[idx] - t < _min_gap:
+            return False
+        if idx > 0 and t - times_sorted[idx - 1] < _min_gap:
             return False
         return True
 
@@ -691,7 +708,7 @@ def _rebalance_columns(notes):
             for dst in under:
                 if dst == col:
                     continue
-                if gap_ok(col_times[dst], t):
+                if gap_ok(dst, col_times[dst], t):
                     # move note
                     notes[i] = (t, dst, is_ln, ln_end)
                     col_times[col].remove(t)
@@ -860,7 +877,20 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord
     ln_end_by_col = {c: -9999.0 for c in range(KEYS)}
     recent_cols   = deque(maxlen=4)   # only needed for adjacent-flow preference
 
+    # Rolling NPS cap: when model confidence is low (probabilities near-uniform),
+    # the percentile threshold stops discriminating and density is uncapped.
+    # Enforce a hard NPS ceiling so each difficulty stays in its intended range.
+    target_nps    = float(DIFFICULTY_PRESETS.get(difficulty, {}).get("target_nps", 999.0))
+    NPS_WIN_MS    = 3000.0   # 3-second window for rolling NPS estimate
+    nps_window    = deque()  # timestamps of recently placed notes
+
     for i, t in enumerate(positions):
+        # ── rolling NPS gate ─────────────────────────────────────────────────
+        while nps_window and t - nps_window[0] > NPS_WIN_MS:
+            nps_window.popleft()
+        if len(nps_window) / (NPS_WIN_MS / 1000) >= target_nps:
+            continue  # already at density cap; skip this timestep
+
         total_placed = sum(col_counts) + 1
         avg_per_col  = total_placed / KEYS
 
@@ -906,12 +936,13 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord
                 placed.append((round(t), col, False, 0))
             col_last[col]    = t
             col_counts[col] += 1
+            nps_window.append(t)
         if primary_col is not None:
             recent_cols.append(primary_col)
 
-    placed = _fill_sparse_windows(placed, all_prob, positions)
-    placed = _diversify_patterns(placed)
-    placed = _rebalance_columns(placed)
+    placed = _fill_sparse_windows(placed, all_prob, positions, min_gap_col=min_gap_col)
+    placed = _diversify_patterns(placed, min_gap_col=min_gap_col)
+    placed = _rebalance_columns(placed, min_gap_col=min_gap_col)
     return placed, {"all_prob": all_prob, "positions": positions, "threshold": threshold}
 
 
