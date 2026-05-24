@@ -212,6 +212,10 @@ def extract_audio_features(audio_path):
     except Exception:
         return None
 
+    # librosa commonly halves fast tempos; double if below 100 BPM
+    if bpm < 100:
+        bpm *= 2
+
     if len(beat_times) == 0 or bpm < 60 or bpm > 400:
         return None
 
@@ -894,21 +898,32 @@ def make_dataset(sequences):
 
 # ── Scanner ───────────────────────────────────────────────────────────────────
 
-def scan_all_maps(maps_dir, max_maps):
+def scan_all_maps(maps_dirs, max_maps):
+    """Scan one or more directories for .osu files."""
+    if isinstance(maps_dirs, str):
+        maps_dirs = [maps_dirs]
     found = []
-    for root, _, files in os.walk(maps_dir):
-        for f in files:
-            if f.endswith(".osu"):
-                found.append(os.path.join(root, f))
+    seen  = set()
+    for maps_dir in maps_dirs:
+        if not os.path.isdir(maps_dir):
+            print(f"  [warn] Directory not found, skipping: {maps_dir}")
+            continue
+        for root, _, files in os.walk(maps_dir):
+            for f in files:
+                if f.endswith(".osu"):
+                    p = os.path.join(root, f)
+                    if p not in seen:
+                        seen.add(p)
+                        found.append(p)
     if max_maps:
         found = found[:max_maps]
-    print(f"  Found {len(found)} .osu files")
+    print(f"  Found {len(found)} .osu files across {len(maps_dirs)} director(y/ies)")
     return found
 
 
 # ── Training ──────────────────────────────────────────────────────────────────
 
-def train(maps_dir, out_path, max_maps, epochs):
+def train(maps_dir, out_path, max_maps, epochs, extra_dirs=None):
     try:
         import torch
         import torch.nn as nn
@@ -924,9 +939,10 @@ def train(maps_dir, out_path, max_maps, epochs):
         _tqdm = lambda x, **kw: x
 
     cache_dir = os.path.join(os.path.dirname(os.path.abspath(out_path)), "_feat_cache")
-    print(f"\nScanning: {maps_dir}")
+    all_dirs  = [maps_dir] + (extra_dirs or [])
+    print(f"\nScanning: {all_dirs}")
     print(f"Cache dir: {cache_dir}")
-    candidates = scan_all_maps(maps_dir, max_maps)
+    candidates = scan_all_maps(all_dirs, max_maps)
     if not candidates:
         print("ERROR: No .osu files found."); sys.exit(1)
     print(f"  Total candidates: {len(candidates)}\n")
@@ -1349,20 +1365,26 @@ def save_training_report(history, conf_matrix, col_balance, out_path):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Train osu!mania 4K Transformer v4")
-    parser.add_argument("--maps-dir", default=DEFAULT_MAPS_DIR)
-    parser.add_argument("--out",      default=DEFAULT_OUT)
-    parser.add_argument("--max-maps", type=int, default=3000)
-    parser.add_argument("--epochs",   type=int, default=50)
+    parser = argparse.ArgumentParser(description="Train osu!mania 4K CNN+BiLSTM")
+    parser.add_argument("--maps-dir",   default=DEFAULT_MAPS_DIR,
+                        help="Primary maps directory (ManiaStyles)")
+    parser.add_argument("--extra-maps", nargs="*", default=[],
+                        help="Additional map directories (e.g. osu! Songs folder)")
+    parser.add_argument("--out",        default=DEFAULT_OUT)
+    parser.add_argument("--max-maps",   type=int, default=5000)
+    parser.add_argument("--epochs",     type=int, default=50)
     args = parser.parse_args()
 
     if not os.path.isdir(args.maps_dir):
         print(f"ERROR: Directory not found: {args.maps_dir}"); sys.exit(1)
 
-    print(f"Maps dir : {args.maps_dir}")
-    print(f"Output   : {args.out}")
-    print(f"Max maps : {args.max_maps}  |  Epochs : {args.epochs}")
-    train(args.maps_dir, args.out, args.max_maps, args.epochs)
+    extra = [d for d in (args.extra_maps or []) if os.path.isdir(d)]
+    print(f"Maps dir  : {args.maps_dir}")
+    if extra:
+        print(f"Extra dirs: {extra}")
+    print(f"Output    : {args.out}")
+    print(f"Max maps  : {args.max_maps}  |  Epochs : {args.epochs}")
+    train(args.maps_dir, args.out, args.max_maps, args.epochs, extra_dirs=extra)
 
 
 if __name__ == "__main__":
