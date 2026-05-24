@@ -17,10 +17,10 @@ KEYS   = 4
 COL_X  = [64, 192, 320, 448]
 
 DIFFICULTY_PRESETS = {
-    "Easy":   {"hp": 6, "od": 6,  "fill": 0.04,  "max_chord": 1, "chord_fill": 0.00, "min_gap_col": 260, "target_nps": 2.5},
-    "Normal": {"hp": 7, "od": 7,  "fill": 0.09,  "max_chord": 2, "chord_fill": 0.03, "min_gap_col": 200, "target_nps": 4.5},
-    "Hard":   {"hp": 8, "od": 8,  "fill": 0.42,  "max_chord": 2, "chord_fill": 0.20, "min_gap_col": 80,  "target_nps": 9.5},
-    "Insane": {"hp": 9, "od": 9,  "fill": 0.65,  "max_chord": 3, "chord_fill": 0.28, "min_gap_col": 60,  "target_nps": 16.0},
+    "Easy":   {"hp": 6, "od": 6,  "fill": 0.04,  "max_chord": 1, "chord_fill": 0.00, "min_gap_col": 260, "target_nps": 2.5,  "target_ln_pct": 0.04},
+    "Normal": {"hp": 7, "od": 7,  "fill": 0.09,  "max_chord": 2, "chord_fill": 0.03, "min_gap_col": 200, "target_nps": 4.5,  "target_ln_pct": 0.07},
+    "Hard":   {"hp": 8, "od": 8,  "fill": 0.42,  "max_chord": 2, "chord_fill": 0.20, "min_gap_col": 80,  "target_nps": 9.5,  "target_ln_pct": 0.10},
+    "Insane": {"hp": 9, "od": 9,  "fill": 0.65,  "max_chord": 3, "chord_fill": 0.28, "min_gap_col": 60,  "target_nps": 16.0, "target_ln_pct": 0.12},
 }
 
 MIN_GAP_SAME_COL_MS  = 130.0  # min ms between notes in the same column (overridden per diff)
@@ -786,6 +786,11 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord
     # ── Pass 1: zero col history (feat_full already zeroed) ──────────────────
     all_prob, all_ln_p, all_ln_dur, all_pat_logits = run_model_pass(feat_full)
 
+    # Compute percentile-based LN threshold from pass-1 probabilities.
+    # Recomputed after pass-2 if col_hist is used.
+    target_ln_pct = float(DIFFICULTY_PRESETS.get(difficulty, {}).get("target_ln_pct", 0.10))
+    ln_threshold  = max(float(np.percentile(all_ln_p, (1.0 - target_ln_pct) * 100)), 1e-4)
+
     if use_col_hist:
         # Greedy pass1 placements — lightweight, just need column sequence
         chord_fill1  = float(DIFFICULTY_PRESETS.get(difficulty, {}).get("chord_fill", 0.12))
@@ -826,7 +831,7 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord
                     to_place.append((_, col))
             for _, col in to_place:
                 p_ln = float(all_ln_p[i, col])
-                if p_ln > 0.35:
+                if p_ln >= ln_threshold:
                     dur_beats = max(float(all_ln_dur[i, col]), 1.0)
                     p1_ln_end_by_col[col] = round(t + dur_beats * beat_length)
                 p1_col_last[col] = t
@@ -847,6 +852,8 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord
         # Inject col history into feat_full (last 16 dims) and re-run
         feat_full[:, -_NN_FEAT_DIM_COL_HIST:] = col_hist
         all_prob, all_ln_p, all_ln_dur, all_pat_logits = run_model_pass(feat_full)
+        # Recompute LN threshold from pass-2 probabilities
+        ln_threshold = max(float(np.percentile(all_ln_p, (1.0 - target_ln_pct) * 100)), 1e-4)
 
     # Rolling per-timestep threshold over a ±8-beat window so the model's
     # probabilities are judged relative to the local section, not the whole song.
@@ -865,6 +872,26 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord
         c_thresholds[i] = float(np.percentile(window, (1.0 - chord_fill) * 100))
     threshold = float(np.median(thresholds))   # representative value for analysis output
 
+    # ── Audio-energy-based density multiplier ────────────────────────────────
+    # Maps with uniform density feel robotic; real Hard maps follow the audio's
+    # dynamic shape — quiet intros/breaks get ~25% density, loud choruses ~100%.
+    # We smooth the raw RMS envelope and normalise it to [0, 1] so the local
+    # energy drives how many of the target_nps notes are actually placed.
+    rms_raw   = audio_data["rms"]
+    rms_times = audio_data["rms_times"]
+    # Clip to the song's dynamic range using the 5th–95th percentile
+    p5  = float(np.percentile(rms_raw, 5))
+    p95 = float(np.percentile(rms_raw, 95))
+    rms_norm = np.clip((rms_raw - p5) / (p95 - p5 + 1e-9), 0.0, 1.0)
+    # Smooth over ~2 s (roughly one phrase) to avoid jitter
+    _smooth_n = max(1, int(2000 / (rms_times[1] - rms_times[0] + 1e-9))) if len(rms_times) > 1 else 1
+    rms_smooth = np.convolve(rms_norm, np.ones(_smooth_n) / _smooth_n, mode="same")
+    # energy_mult[i] ∈ [0.25, 1.0] — each grid position's density allowance
+    energy_mult = np.zeros(T, dtype=np.float32)
+    for _i, _t in enumerate(positions):
+        _idx = min(int(np.searchsorted(rms_times, _t)), len(rms_smooth) - 1)
+        energy_mult[_i] = 0.25 + 0.75 * float(rms_smooth[_idx])
+
     # Greedy time-ordered placement driven by the model's per-column probabilities.
     # The CNN+BiLSTM backbone learns pattern structure from training data, so only
     # physical constraints (timing gaps, balance) and a mild flow preference are kept
@@ -879,17 +906,19 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord
 
     # Rolling NPS cap: when model confidence is low (probabilities near-uniform),
     # the percentile threshold stops discriminating and density is uncapped.
-    # Enforce a hard NPS ceiling so each difficulty stays in its intended range.
+    # Enforce a hard NPS ceiling scaled by local audio energy so density follows
+    # the song's dynamic shape (quiet sections sparser, loud sections denser).
     target_nps    = float(DIFFICULTY_PRESETS.get(difficulty, {}).get("target_nps", 999.0))
     NPS_WIN_MS    = 3000.0   # 3-second window for rolling NPS estimate
     nps_window    = deque()  # timestamps of recently placed notes
 
     for i, t in enumerate(positions):
-        # ── rolling NPS gate ─────────────────────────────────────────────────
+        # ── rolling NPS gate (energy-scaled) ─────────────────────────────────
         while nps_window and t - nps_window[0] > NPS_WIN_MS:
             nps_window.popleft()
-        if len(nps_window) / (NPS_WIN_MS / 1000) >= target_nps:
-            continue  # already at density cap; skip this timestep
+        effective_nps = target_nps * float(energy_mult[i])
+        if len(nps_window) / (NPS_WIN_MS / 1000) >= effective_nps:
+            continue  # already at local density cap; skip this timestep
 
         total_placed = sum(col_counts) + 1
         avg_per_col  = total_placed / KEYS
@@ -927,7 +956,7 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord
         primary_col = notes_to_place[0][1] if notes_to_place else None
         for _, col in notes_to_place:
             p_ln = float(all_ln_p[i, col])
-            if p_ln > 0.35:
+            if p_ln >= ln_threshold:
                 dur_beats = max(float(all_ln_dur[i, col]), 1.0)
                 ln_end_ms = round(t + dur_beats * beat_length)
                 placed.append((round(t), col, True, ln_end_ms))
