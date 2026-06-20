@@ -8,6 +8,7 @@ deploy:
   only:
     - main
   script:
+    - cd $CI_PROJECT_DIR && git lfs pull
     - cp $CI_PROJECT_DIR/ManiaMapper.py /opt/maniamapper/
     - cp $CI_PROJECT_DIR/app.py /opt/maniamapper/
     - cp $CI_PROJECT_DIR/requirements.txt /opt/maniamapper/
