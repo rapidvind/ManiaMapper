@@ -140,7 +140,9 @@ async def generate(
         raise HTTPException(504, "Generation timed out (>120s).")
 
     if result.returncode != 0:
-        raise HTTPException(500, f"Generation failed:\n{result.stderr[-2000:]}")
+        out = (result.stdout or "")[-1000:]
+        err = (result.stderr or "")[-1000:]
+        raise HTTPException(500, f"Generation failed (rc={result.returncode}):\nSTDOUT: {out}\nSTDERR: {err}")
 
     # ── Find the .osz output ──────────────────────────────────────────────────
     osz_files = list(job_dir.glob("*.osz"))
