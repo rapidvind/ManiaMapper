@@ -1,0 +1,120 @@
+Maps dir : C:\Users\Aravind Dora\Desktop\ManiaMapper\ManiaStyles
+Output   : C:\Users\Aravind Dora\Desktop\ManiaMapper\mania_model.pt
+Max maps : 3000  |  Epochs : 50
+
+Scanning: C:\Users\Aravind Dora\Desktop\ManiaMapper\ManiaStyles
+Cache dir: C:\Users\Aravind Dora\Desktop\ManiaMapper\_feat_cache
+  Found 151 .osu files
+  Total candidates: 151
+
+Extracting features:   0%|          | 0/151 [00:00<?, ?it/s]Extracting features:   1%|          | 1/151 [00:12<32:22, 12.95s/it]Extracting features:   4%|3         | 6/151 [00:13<03:53,  1.61s/it]Extracting features:   4%|3         | 6/151 [00:30<03:53,  1.61s/it]Extracting features:   7%|7         | 11/151 [00:40<08:41,  3.73s/it]Extracting features:   8%|7         | 12/151 [00:55<12:20,  5.33s/it]Extracting features:   9%|8         | 13/151 [01:11<16:18,  7.09s/it]Extracting features:   9%|9         | 14/151 [01:25<19:20,  8.47s/it]Extracting features:  10%|9         | 15/151 [01:41<22:23,  9.88s/it]Extracting features:  11%|#         | 16/151 [01:54<24:08, 10.73s/it]Extracting features:  11%|#1        | 17/151 [02:08<25:47, 11.55s/it]Extracting features:  12%|#1        | 18/151 [02:21<26:12, 11.82s/it]Extracting features:  13%|#2        | 19/151 [02:37<28:57, 13.16s/it]Extracting features:  13%|#3        | 20/151 [03:06<38:01, 17.42s/it]Extracting features:  14%|#3        | 21/151 [03:06<26:59, 12.46s/it]Extracting features:  14%|#3        | 21/151 [03:20<26:59, 12.46s/it]Extracting features:  15%|#4        | 22/151 [03:32<35:22, 16.46s/it]Extracting features:  15%|#5        | 23/151 [03:56<39:32, 18.53s/it]Extracting features:  16%|#5        | 24/151 [04:17<41:03, 19.40s/it]Extracting features:  17%|#6        | 25/151 [04:37<40:50, 19.45s/it]Extracting features:  17%|#7        | 26/151 [04:55<40:09, 19.28s/it]Extracting features:  19%|#9        | 29/151 [04:56<17:17,  8.50s/it]Extracting features:  19%|#9        | 29/151 [05:10<17:17,  8.50s/it]Extracting features:  21%|##        | 31/151 [05:20<19:28,  9.74s/it]Extracting features:  21%|##1       | 32/151 [05:42<24:26, 12.33s/it]Extracting features:  22%|##1       | 33/151 [06:03<27:39, 14.07s/it]Extracting features:  23%|##2       | 34/151 [06:21<29:26, 15.10s/it]Extracting features:  23%|##3       | 35/151 [06:38<30:06, 15.57s/it]Extracting features:  24%|##3       | 36/151 [06:51<28:37, 14.93s/it]Extracting features:  26%|##6       | 40/151 [07:15<17:30,  9.46s/it]Extracting features:  27%|##7       | 41/151 [07:15<14:19,  7.81s/it]Extracting features:  28%|##8       | 43/151 [07:15<09:25,  5.23s/it]Extracting features:  30%|##9       | 45/151 [07:25<09:11,  5.20s/it]Extracting features:  31%|###1      | 47/151 [07:26<06:11,  3.58s/it]Extracting features:  32%|###2      | 49/151 [07:26<04:13,  2.48s/it]Extracting features:  32%|###2      | 49/151 [07:40<04:13,  2.48s/it]Extracting features:  33%|###3      | 50/151 [07:53<11:51,  7.04s/it]Extracting features:  34%|###3      | 51/151 [08:18<17:58, 10.78s/it]Extracting features:  34%|###4      | 52/151 [08:36<20:16, 12.29s/it]Extracting features:  35%|###5      | 53/151 [08:46<19:20, 11.84s/it]Extracting features:  36%|###6      | 55/151 [08:46<11:11,  7.00s/it]Extracting features:  38%|###7      | 57/151 [08:47<06:56,  4.43s/it]Extracting features:  39%|###9      | 59/151 [08:47<04:30,  2.94s/it]Extracting features:  41%|####1     | 62/151 [08:47<02:31,  1.71s/it]Extracting features:  42%|####2     | 64/151 [08:56<03:38,  2.51s/it]Extracting features:  44%|####3     | 66/151 [08:56<02:32,  1.79s/it]Extracting features:  45%|####5     | 68/151 [08:56<01:46,  1.28s/it]Extracting features:  46%|####6     | 70/151 [08:56<01:14,  1.09it/s]Extracting features:  48%|####7     | 72/151 [09:05<02:38,  2.00s/it]Extracting features:  49%|####9     | 74/151 [09:06<01:49,  1.43s/it]Extracting features:  50%|#####     | 76/151 [09:16<03:12,  2.56s/it]Extracting features:  52%|#####1    | 78/151 [09:16<02:12,  1.82s/it]Extracting features:  53%|#####2    | 80/151 [09:16<01:32,  1.30s/it]Extracting features:  53%|#####2    | 80/151 [09:30<01:32,  1.30s/it]Extracting features:  54%|#####4    | 82/151 [09:58<08:12,  7.14s/it]Extracting features:  56%|#####5    | 84/151 [10:07<07:04,  6.33s/it]Extracting features:  57%|#####6    | 86/151 [10:07<04:49,  4.45s/it]Extracting features:  58%|#####8    | 88/151 [10:07<03:17,  3.14s/it]Extracting features:  58%|#####8    | 88/151 [10:20<03:17,  3.14s/it]Extracting features:  60%|#####9    | 90/151 [10:37<06:50,  6.73s/it]Extracting features:  60%|######    | 91/151 [10:51<07:54,  7.91s/it]Extracting features:  61%|######    | 92/151 [10:51<06:14,  6.34s/it]Extracting features:  62%|######2   | 94/151 [10:51<03:51,  4.05s/it]Extracting features:  64%|######3   | 96/151 [10:59<03:44,  4.09s/it]Extracting features:  65%|######4   | 98/151 [10:59<02:26,  2.76s/it]Extracting features:  66%|######6   | 100/151 [11:09<02:53,  3.40s/it]Extracting features:  68%|######7   | 102/151 [11:09<01:55,  2.36s/it]Extracting features:  69%|######8   | 104/151 [11:09<01:17,  1.65s/it]Extracting features:  70%|#######   | 106/151 [11:18<01:54,  2.54s/it]Extracting features:  72%|#######1  | 108/151 [11:18<01:16,  1.79s/it]Extracting features:  72%|#######2  | 109/151 [11:27<02:03,  2.94s/it]Extracting features:  74%|#######3  | 111/151 [11:27<01:18,  1.97s/it]Extracting features:  75%|#######4  | 113/151 [11:27<00:51,  1.35s/it]Extracting features:  76%|#######6  | 115/151 [11:36<01:24,  2.35s/it]Extracting features:  77%|#######7  | 117/151 [11:36<00:55,  1.64s/it]Extracting features:  79%|#######8  | 119/151 [11:36<00:36,  1.16s/it]Extracting features:  80%|########  | 121/151 [11:45<01:03,  2.10s/it]Extracting features:  81%|########1 | 123/151 [11:45<00:41,  1.48s/it]Extracting features:  83%|########3 | 126/151 [11:45<00:22,  1.09it/s]Extracting features:  86%|########6 | 130/151 [11:45<00:11,  1.86it/s]Extracting features:  88%|########8 | 133/151 [11:45<00:06,  2.63it/s]Extracting features:  90%|######### | 136/151 [11:45<00:04,  3.65it/s]Extracting features:  92%|#########2| 139/151 [11:46<00:02,  4.92it/s]Extracting features:  92%|#########2| 139/151 [12:00<00:02,  4.92it/s]Extracting features:  93%|#########2| 140/151 [12:03<00:26,  2.38s/it]Extracting features:  94%|#########4| 142/151 [12:03<00:15,  1.76s/it]Extracting features:  96%|#########6| 145/151 [12:12<00:13,  2.21s/it]Extracting features:  97%|#########7| 147/151 [12:12<00:06,  1.66s/it]Extracting features:  99%|#########8| 149/151 [12:21<00:04,  2.43s/it]Extracting features: 100%|##########| 151/151 [12:40<00:00,  4.36s/it]Extracting features: 100%|##########| 151/151 [12:40<00:00,  5.04s/it]
+
+Usable maps : 127 / 151
+  Easy:14  Normal:21  Hard:52  Insane:40
+  LN notes: 45807  |  Regular notes: 222013  |  LN ratio: 0.171
+
+Building cross-difficulty context...
+  Cross-diff pairs: 20 audio files with 2+ difficulties
+Dataset     : 2408 sequences x 256 steps
+
+Model       : ManiaCNNLSTM  |  device: cuda  |  params: 6,965,858
+Features    :
+  mel(80) + onset(1) + onset_harm(1) + onset_perc(1)
+  + SC(7) + chroma(12) + rms(1) + flatness(1)
+  + centroid(1) + zcr(1) + phases_4scales(8)
+  = 114 audio  +  16 ctx  +  16 col_hist  =  146 total
+Grid        : SUBDIV=8  |  4 difficulty heads  |  18 pattern classes
+Hyperparams : d_model=384  lstm_hidden=192  lstm_layers=4  dropout=0.2
+
+Pattern class weights (capped 0.1-20):
+   0 REST             count=  270088  weight=0.126
+   1 SINGLE           count=   11977  weight=2.850
+   2 CHORD_2          count=    6385  weight=5.346
+   3 CHORD_3          count=     942  weight=20.000
+   4 JACK             count=    1320  weight=20.000
+   5 CHORD_JACK       count=       2  weight=20.000
+   6 TRILL_2COL       count=     449  weight=20.000
+   7 TRILL_STAIR_U    count=      52  weight=20.000
+   8 TRILL_STAIR_D    count=     118  weight=20.000
+   9 TRILL_SPLIT      count=     830  weight=20.000
+  10 TRILL_CHORD      count=   11261  weight=3.031
+  11 STREAM           count=   19690  weight=1.734
+  12 COMPLEX_STR      count=   62787  weight=0.544
+  13 JUMP_STR         count=  150290  weight=0.227
+  14 LN_START         count=   20920  weight=1.632
+  15 COMPLEX_LN       count=   25568  weight=1.335
+  16 CHORD_LN         count=    7747  weight=4.406
+  17 MELODY_LN        count=   23974  weight=1.424
+
+  Epoch   1/50  loss: 15.6446  hit: 4.535  ln: 1.019  pat: 0.692  pat_acc: 7.9%  lr: 1.33e-04
+  Epoch   2/50  loss: 7.5106  hit: 3.570  ln: 0.776  pat: 0.616  pat_acc: 27.5%  lr: 2.00e-04
+  Epoch   3/50  loss: 4.2625  hit: 1.599  ln: 0.788  pat: 0.561  pat_acc: 44.0%  lr: 2.00e-04
+  Epoch   4/50  loss: 2.3061  hit: 0.470  ln: 0.773  pat: 0.513  pat_acc: 51.0%  lr: 2.00e-04
+  Epoch   5/50  loss: 1.8392  hit: 0.256  ln: 0.739  pat: 0.468  pat_acc: 53.5%  lr: 1.99e-04
+  Epoch   6/50  loss: 1.6224  hit: 0.190  ln: 0.713  pat: 0.431  pat_acc: 57.2%  lr: 1.98e-04
+  Epoch   7/50  loss: 1.4718  hit: 0.157  ln: 0.668  pat: 0.396  pat_acc: 59.8%  lr: 1.96e-04
+  Epoch   8/50  loss: 1.3778  hit: 0.137  ln: 0.639  pat: 0.364  pat_acc: 63.6%  lr: 1.94e-04
+  Epoch   9/50  loss: 1.2788  hit: 0.118  ln: 0.628  pat: 0.340  pat_acc: 65.5%  lr: 1.92e-04
+  Epoch  10/50  loss: 1.2053  hit: 0.109  ln: 0.593  pat: 0.314  pat_acc: 68.6%  lr: 1.89e-04
+  Epoch  11/50  loss: 1.1101  hit: 0.097  ln: 0.559  pat: 0.292  pat_acc: 70.6%  lr: 1.86e-04
+  Epoch  12/50  loss: 1.0437  hit: 0.087  ln: 0.535  pat: 0.271  pat_acc: 72.5%  lr: 1.82e-04
+  Epoch  13/50  loss: 0.9719  hit: 0.077  ln: 0.495  pat: 0.253  pat_acc: 73.7%  lr: 1.78e-04
+  Epoch  14/50  loss: 0.9161  hit: 0.071  ln: 0.473  pat: 0.240  pat_acc: 74.7%  lr: 1.74e-04
+  Epoch  15/50  loss: 0.8673  hit: 0.063  ln: 0.460  pat: 0.221  pat_acc: 76.8%  lr: 1.70e-04
+  Epoch  16/50  loss: 0.8093  hit: 0.057  ln: 0.419  pat: 0.209  pat_acc: 77.8%  lr: 1.65e-04
+  Epoch  17/50  loss: 0.7728  hit: 0.053  ln: 0.406  pat: 0.197  pat_acc: 78.7%  lr: 1.59e-04
+  Epoch  18/50  loss: 0.7318  hit: 0.049  ln: 0.379  pat: 0.188  pat_acc: 79.6%  lr: 1.54e-04
+  Epoch  19/50  loss: 0.6816  hit: 0.045  ln: 0.362  pat: 0.176  pat_acc: 80.5%  lr: 1.48e-04
+  Epoch  20/50  loss: 0.6413  hit: 0.042  ln: 0.337  pat: 0.166  pat_acc: 81.4%  lr: 1.42e-04
+  Epoch  21/50  loss: 0.6178  hit: 0.040  ln: 0.326  pat: 0.157  pat_acc: 82.2%  lr: 1.36e-04
+  Epoch  22/50  loss: 0.5936  hit: 0.036  ln: 0.317  pat: 0.152  pat_acc: 82.5%  lr: 1.30e-04
+  Epoch  23/50  loss: 0.5512  hit: 0.034  ln: 0.289  pat: 0.143  pat_acc: 83.1%  lr: 1.23e-04
+  Epoch  24/50  loss: 0.5318  hit: 0.032  ln: 0.283  pat: 0.135  pat_acc: 84.1%  lr: 1.17e-04
+  Epoch  25/50  loss: 0.5024  hit: 0.030  ln: 0.266  pat: 0.129  pat_acc: 84.8%  lr: 1.10e-04
+  Epoch  26/50  loss: 0.4844  hit: 0.029  ln: 0.259  pat: 0.125  pat_acc: 85.0%  lr: 1.03e-04
+  Epoch  27/50  loss: 0.4667  hit: 0.027  ln: 0.250  pat: 0.119  pat_acc: 85.7%  lr: 9.67e-05
+  Epoch  28/50  loss: 0.4467  hit: 0.025  ln: 0.237  pat: 0.114  pat_acc: 86.1%  lr: 9.00e-05
+  Epoch  29/50  loss: 0.4323  hit: 0.024  ln: 0.232  pat: 0.109  pat_acc: 86.5%  lr: 8.34e-05
+  Epoch  30/50  loss: 0.4135  hit: 0.023  ln: 0.224  pat: 0.105  pat_acc: 87.0%  lr: 7.68e-05
+  Epoch  31/50  loss: 0.4016  hit: 0.022  ln: 0.214  pat: 0.101  pat_acc: 87.4%  lr: 7.04e-05
+  Epoch  32/50  loss: 0.3875  hit: 0.021  ln: 0.207  pat: 0.098  pat_acc: 87.8%  lr: 6.41e-05
+  Epoch  33/50  loss: 0.3747  hit: 0.021  ln: 0.202  pat: 0.095  pat_acc: 88.0%  lr: 5.79e-05
+  Epoch  34/50  loss: 0.3609  hit: 0.020  ln: 0.194  pat: 0.092  pat_acc: 88.5%  lr: 5.19e-05
+  Epoch  35/50  loss: 0.3519  hit: 0.019  ln: 0.190  pat: 0.089  pat_acc: 88.6%  lr: 4.62e-05
+  Epoch  36/50  loss: 0.3436  hit: 0.019  ln: 0.186  pat: 0.087  pat_acc: 88.9%  lr: 4.07e-05
+  Epoch  37/50  loss: 0.3419  hit: 0.018  ln: 0.185  pat: 0.085  pat_acc: 89.1%  lr: 3.54e-05
+  Epoch  38/50  loss: 0.3384  hit: 0.018  ln: 0.183  pat: 0.083  pat_acc: 89.3%  lr: 3.05e-05
+  Epoch  39/50  loss: 0.3266  hit: 0.017  ln: 0.178  pat: 0.082  pat_acc: 89.4%  lr: 2.58e-05
+  Epoch  40/50  loss: 0.3216  hit: 0.017  ln: 0.175  pat: 0.081  pat_acc: 89.6%  lr: 2.15e-05
+  Epoch  41/50  loss: 0.3166  hit: 0.017  ln: 0.172  pat: 0.079  pat_acc: 89.7%  lr: 1.76e-05
+  Epoch  42/50  loss: 0.3145  hit: 0.017  ln: 0.172  pat: 0.079  pat_acc: 89.8%  lr: 1.40e-05
+  Epoch  43/50  loss: 0.3107  hit: 0.017  ln: 0.170  pat: 0.078  pat_acc: 89.9%  lr: 1.07e-05
+  Epoch  44/50  loss: 0.3102  hit: 0.017  ln: 0.169  pat: 0.077  pat_acc: 90.0%  lr: 7.94e-06
+  Epoch  45/50  loss: 0.3034  hit: 0.016  ln: 0.164  pat: 0.077  pat_acc: 90.0%  lr: 5.53e-06
+  Epoch  46/50  loss: 0.3090  hit: 0.016  ln: 0.170  pat: 0.076  pat_acc: 90.0%  lr: 3.55e-06
+  Epoch  47/50  loss: 0.3058  hit: 0.016  ln: 0.168  pat: 0.076  pat_acc: 90.1%  lr: 2.00e-06
+  Epoch  48/50  loss: 0.3006  hit: 0.016  ln: 0.164  pat: 0.076  pat_acc: 90.0%  lr: 8.92e-07
+  Epoch  49/50  loss: 0.3013  hit: 0.016  ln: 0.164  pat: 0.076  pat_acc: 90.1%  lr: 2.23e-07
+  Epoch  50/50  loss: 0.3044  hit: 0.016  ln: 0.167  pat: 0.076  pat_acc: 90.1%  lr: 0.00e+00
+
+Computing post-training diagnostics...
+
+Model saved -> C:\Users\Aravind Dora\Desktop\ManiaMapper\mania_model.pt
+  Maps : 127   Sequences : 2408
+  Training report -> C:\Users\Aravind Dora\Desktop\ManiaMapper\mania_model_training_report.png
+
+Next: python ManiaMapper.py --ui
+Loading model: C:\Users\Aravind Dora\Desktop\ManiaMapper\mania_model.pt
+  Trained on 127 maps
+[1/3] Analysing audio...
+   BPM: 172.3  |  Grid steps: 4284
+[2/3] Generating notes...
+   2066 notes  |  fill: top 26%
+[3/3] Building .osz...
+   Analysis PNG  -> C:\Users\Aravind Dora\Downloads\My Burning Star_Hard_analysis.png
+   Analysis JSON -> C:\Users\Aravind Dora\Downloads\My Burning Star_Hard_analysis.json
+
+  Done!  2066 notes  |  BPM: 172.3
+  Output: C:\Users\Aravind Dora\Downloads\Unknown - My Burning Star [Hard].osz
+
+  Double-click the .osz to import into osu!

@@ -51,8 +51,13 @@ SR          = 22050
 #                 phases_4scales(8) = 114
 FEAT_DIM_AUDIO    = 114
 FEAT_DIM_CTX      = 16       # cross-diff context (4 diffs × 4 cols)
-FEAT_DIM_COL_HIST = 16       # column history (last 4 placed cols, one-hot 4×4)
-FEAT_DIM          = FEAT_DIM_AUDIO + FEAT_DIM_CTX + FEAT_DIM_COL_HIST  # = 146
+FEAT_DIM_COL_HIST = 0        # col_hist moves out of features into decoder event embeddings
+FEAT_DIM          = FEAT_DIM_AUDIO + FEAT_DIM_CTX  # = 130
+
+# Autoregressive decoder hyper-parameters
+EVENT_EMB_DIM = 64    # dimension of learned event embedding in decoder
+DEC_HIDDEN    = 256   # decoder unidirectional LSTM hidden size
+DEC_LAYERS    = 2     # decoder LSTM layers
 SEQ_LEN     = 256
 DIFF_LEVELS = 4
 DIFF_EMB    = 32
@@ -64,6 +69,11 @@ D_MODEL     = 384
 LSTM_HIDDEN = D_MODEL // 2   # bidirectional → output = 2×192 = 384 = D_MODEL
 LSTM_LAYERS = 4
 DROPOUT     = 0.20
+
+# Density-aware loss
+DENSITY_WIN    = 48    # ~2 s window at 32nd-note grid (172 BPM ≈ 43 ms/step → 48 steps)
+DENSITY_STRIDE = 24    # 50 % overlap between windows
+DENSITY_WEIGHT = 5.0   # L1 weight relative to hit BCE loss
 
 # Pattern constants — 18 classes
 PATTERN_REST          = 0
@@ -85,7 +95,7 @@ PATTERN_COMPLEX_LN    = 15
 PATTERN_CHORD_LN      = 16
 PATTERN_MELODY_LN     = 17
 
-DEFAULT_MAPS_DIR = r"C:\Users\Aravind Dora\Desktop\ManiaMapper\ManiaStyles"
+DEFAULT_MAPS_DIR = r"C:\Users\Aravind Dora\AppData\Local\osu!\Songs"
 DEFAULT_OUT      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mania_model.pt")
 
 
@@ -675,37 +685,22 @@ def extract_features_and_labels(audio_path, groups, version_str, cache_dir=None)
     return feat_audio, hit_labels, ln_labels, ln_dur_lbls, pattern_types, diff_level, audio_path
 
 
-# ── Column history features ───────────────────────────────────────────────────
-
-def build_col_history_features(hit_labels):
-    """
-    Build per-timestep column history from ground-truth placements.
-    At timestep t, encode the last 4 individually placed columns as one-hot
-    vectors so the model can learn sequencing patterns from training data.
-
-    Layout (16 dims): [prev1_onehot(4) | prev2_onehot(4) | prev3_onehot(4) | prev4_onehot(4)]
-    prev1 = most recently placed column before t.
-
-    hit_labels: (T, 4) float32
-    Returns:    (T, 16) float32
-    """
-    T      = hit_labels.shape[0]
-    col_hist = np.zeros((T, FEAT_DIM_COL_HIST), dtype=np.float32)
-    recent = []   # chronological list of placed columns
-
-    for t in range(T):
-        n = len(recent)
-        for k in range(min(n, 4)):
-            col = recent[n - 1 - k]   # k=0 → most recent
-            col_hist[t, k * 4 + col] = 1.0
-        for col in range(4):
-            if hit_labels[t, col] > 0.5:
-                recent.append(col)
-
-    return col_hist
-
-
 # ── Cross-difficulty context ──────────────────────────────────────────────────
+
+def build_event_history(hit_labels, ln_labels):
+    """
+    Build shifted event sequence for teacher forcing.
+    event_history[t] = what was placed at step t-1 (8 dims: 4 hit + 4 ln).
+    event_history[0] = zeros (nothing placed before sequence start).
+    hit_labels, ln_labels: (T, 4) float32
+    Returns: (T, 8) float32
+    """
+    T = hit_labels.shape[0]
+    ev = np.zeros((T, 8), dtype=np.float32)
+    ev[1:, :4] = (hit_labels[:-1] > 0.5).astype(np.float32)
+    ev[1:, 4:] = (ln_labels[:-1]  > 0.5).astype(np.float32)
+    return ev
+
 
 def build_cross_diff_context(sequences):
     """
@@ -713,7 +708,8 @@ def build_cross_diff_context(sequences):
     representing sibling difficulty hit_labels at each position:
         [Easy_C1..Easy_C4 | Normal_C1..C4 | Hard_C1..C4 | Insane_C1..C4]
     Where a difficulty is absent, the 4 values are zero.
-    Returns list of (feat_full, hit_labels, ln_labels, ln_dur_lbls, pattern_types, diff_level).
+    Returns list of (feat_full, hit_labels, ln_labels, ln_dur_lbls, pattern_types,
+                     diff_level, event_history).
     """
     from collections import defaultdict
 
@@ -733,9 +729,9 @@ def build_cross_diff_context(sequences):
                 sibling_lbl = audio_map[audio_path][d]
                 n = min(T, len(sibling_lbl))
                 ctx[:n, d * 4:(d + 1) * 4] = sibling_lbl[:n]
-        col_hist  = build_col_history_features(hit_lbl)                        # (T, 16)
-        feat_full = np.concatenate([feat_audio, ctx, col_hist], axis=1)        # (T, 146)
-        result.append((feat_full, hit_lbl, ln_lbl, ln_dur, pat_types, diff_level))
+        feat_full     = np.concatenate([feat_audio, ctx], axis=1)              # (T, 130)
+        event_history = build_event_history(hit_lbl, ln_lbl)                  # (T, 8)
+        result.append((feat_full, hit_lbl, ln_lbl, ln_dur, pat_types, diff_level, event_history))
 
     n_cross = sum(1 for ap, dmap in audio_map.items() if len(dmap) > 1)
     print(f"  Cross-diff pairs: {n_cross} audio files with 2+ difficulties")
@@ -746,7 +742,8 @@ def build_cross_diff_context(sequences):
 
 def build_model(feat_dim=FEAT_DIM, diff_levels=DIFF_LEVELS, diff_emb=DIFF_EMB,
                 d_model=D_MODEL, lstm_hidden=LSTM_HIDDEN, lstm_layers=LSTM_LAYERS,
-                dropout=DROPOUT):
+                dropout=DROPOUT, max_ln_beats=MAX_LN_BEATS, num_patterns=NUM_PATTERNS,
+                event_emb_dim=EVENT_EMB_DIM, dec_hidden=DEC_HIDDEN, dec_layers=DEC_LAYERS):
     try:
         import torch
         import torch.nn as nn
@@ -799,69 +796,104 @@ def build_model(feat_dim=FEAT_DIM, diff_levels=DIFF_LEVELS, diff_emb=DIFF_EMB,
             return (
                 self.hit_out(h2),
                 self.ln_out(h2),
-                torch.sigmoid(self.ln_dur_out(h2)) * MAX_LN_BEATS,
+                torch.sigmoid(self.ln_dur_out(h2)) * max_ln_beats,
             )
 
-    class ManiaCNNLSTM(nn.Module):
+    class ManiaARModel(nn.Module):
         """
-        CNN + BiLSTM architecture for osu!mania 4K generation.
+        Audio Encoder (CNN + BiLSTM) + Pattern Decoder (causal unidirectional LSTM).
 
-        Two PatternConvBlocks extract local note patterns at multiple temporal
-        scales, then a stacked BiLSTM models longer-range sequential dependencies
-        (streams, LN arcs, phrase structure).  Because the LSTM hidden state
-        encodes recent sequence history, the inference loop needs far fewer
-        hand-crafted pattern dampening heuristics.
+        Encoder processes the full audio sequence with bidirectional context.
+        Decoder generates note placements left-to-right, conditioned on:
+          - audio_context[t] from the encoder
+          - embedding of the event placed at step t-1
 
-        Input : x    (B, T, feat_dim)
-                diff (B,)  — difficulty index 0-3
-        Output: (list of 4 DiffHead outputs, pattern_logits)
-                DiffHead output: (hit_logits, ln_logits, ln_dur)  each (B, T, 4)
-                pattern_logits: (B, T, NUM_PATTERNS)
+        Training: teacher forcing via event_history (ground truth shifted events).
+        Inference: step-by-step autoregressive using model's own predictions.
         """
         def __init__(self):
             super().__init__()
-            self.diff_emb   = nn.Embedding(diff_levels, diff_emb)
-            self.input_proj = nn.Linear(feat_dim + diff_emb, d_model)
-            self.conv1      = PatternConvBlock(d_model, drop=dropout)
-            self.conv2      = PatternConvBlock(d_model, drop=dropout)
-            # BiLSTM: hidden_size = lstm_hidden; bidirectional → output = 2*lstm_hidden = d_model
-            self.lstm       = nn.LSTM(
+            # ── Difficulty embedding ──────────────────────────────────────────────
+            self.diff_emb    = nn.Embedding(diff_levels, diff_emb)
+
+            # ── Audio encoder (bidirectional — same as before) ────────────────────
+            self.input_proj  = nn.Linear(feat_dim + diff_emb, d_model)
+            self.conv1       = PatternConvBlock(d_model, drop=dropout)
+            self.conv2       = PatternConvBlock(d_model, drop=dropout)
+            self.enc_lstm    = nn.LSTM(
                 input_size=d_model,
-                hidden_size=lstm_hidden,
+                hidden_size=d_model // 2,          # bidirectional → output = d_model
                 num_layers=lstm_layers,
                 batch_first=True,
                 bidirectional=True,
                 dropout=dropout if lstm_layers > 1 else 0.0,
             )
-            self.lstm_norm  = nn.LayerNorm(d_model)
+            self.enc_norm    = nn.LayerNorm(d_model)
+
+            # ── Event embedding: 8-dim binary → event_emb_dim ─────────────────────
+            self.event_proj  = nn.Linear(8, event_emb_dim)
+
+            # ── Pattern decoder (causal, unidirectional) ──────────────────────────
+            self.dec_lstm    = nn.LSTM(
+                input_size=d_model + event_emb_dim,
+                hidden_size=dec_hidden,
+                num_layers=dec_layers,
+                batch_first=True,
+                bidirectional=False,
+                dropout=dropout if dec_layers > 1 else 0.0,
+            )
+            self.dec_norm    = nn.LayerNorm(dec_hidden)
+
+            # ── Output heads ──────────────────────────────────────────────────────
             self.pattern_head = nn.Sequential(
-                nn.Linear(d_model, d_model // 4),
+                nn.Linear(dec_hidden, dec_hidden // 4),
                 nn.GELU(),
-                nn.Linear(d_model // 4, NUM_PATTERNS),
+                nn.Linear(dec_hidden // 4, num_patterns),
             )
             self.heads = nn.ModuleList([
-                DiffHead(d_model, drop=dropout)
+                DiffHead(dec_hidden, drop=dropout)
                 for _ in range(diff_levels)
             ])
 
-        def forward(self, x, diff):
+        def encode_audio(self, x, diff):
+            """Run audio encoder. Returns audio_context (B, T, d_model)."""
             B, T, _ = x.shape
             d = self.diff_emb(diff).unsqueeze(1).expand(B, T, -1)
             h = self.input_proj(torch.cat([x, d], dim=-1))
             h = self.conv1(h)
             h = self.conv2(h)
-            lstm_out, _ = self.lstm(h)
-            h = self.lstm_norm(h + lstm_out)
+            enc_out, _ = self.enc_lstm(h)
+            return self.enc_norm(h + enc_out)
+
+        def decode(self, audio_ctx, event_history, hc=None):
+            """
+            Run decoder over a sequence.
+            audio_ctx    : (B, T, d_model)
+            event_history: (B, T, 8) — shifted ground truth events for teacher forcing,
+                           or model predictions for autoregressive inference
+            hc           : optional initial LSTM state (for chunked inference)
+            Returns: (dec_out (B, T, dec_hidden), new_hc)
+            """
+            ev  = self.event_proj(event_history)              # (B, T, event_emb_dim)
+            inp = torch.cat([audio_ctx, ev], dim=-1)          # (B, T, d_model+event_emb_dim)
+            dec_out, hc_new = self.dec_lstm(inp, hc)
+            return self.dec_norm(dec_out), hc_new
+
+        def forward(self, x, diff, event_history):
+            """
+            Full forward pass for training (teacher forcing).
+            x            : (B, T, feat_dim)
+            diff         : (B,)
+            event_history: (B, T, 8)  — ground truth events shifted by 1
+            Returns: (head_outputs, pattern_logits)
+            """
+            audio_ctx      = self.encode_audio(x, diff)
+            h, _           = self.decode(audio_ctx, event_history)
             pattern_logits = self.pattern_head(h)
             head_outputs   = [head(h) for head in self.heads]
             return head_outputs, pattern_logits
 
-    try:
-        import torch
-    except ImportError:
-        print("ERROR: pip install torch"); sys.exit(1)
-
-    return ManiaCNNLSTM()
+    return ManiaARModel()
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
@@ -877,17 +909,18 @@ def make_dataset(sequences):
         def __init__(self, seqs, seq_len=SEQ_LEN):
             self.samples = []
             stride = seq_len // 2
-            for feat_full, hit_lbl, ln_lbl, ln_dur, pat_types, diff_level in seqs:
+            for feat_full, hit_lbl, ln_lbl, ln_dur, pat_types, diff_level, event_history in seqs:
                 T = len(feat_full)
                 for start in range(0, T - seq_len, stride):
                     end = start + seq_len
                     self.samples.append((
-                        torch.tensor(feat_full[start:end],  dtype=torch.float32),
-                        torch.tensor(hit_lbl[start:end],    dtype=torch.float32),
-                        torch.tensor(ln_lbl[start:end],     dtype=torch.float32),
-                        torch.tensor(ln_dur[start:end],     dtype=torch.float32),
-                        torch.tensor(pat_types[start:end],  dtype=torch.int64),
-                        torch.tensor(diff_level,             dtype=torch.long),
+                        torch.tensor(feat_full[start:end],      dtype=torch.float32),
+                        torch.tensor(hit_lbl[start:end],        dtype=torch.float32),
+                        torch.tensor(ln_lbl[start:end],         dtype=torch.float32),
+                        torch.tensor(ln_dur[start:end],         dtype=torch.float32),
+                        torch.tensor(pat_types[start:end],      dtype=torch.int64),
+                        torch.tensor(diff_level,                 dtype=torch.long),
+                        torch.tensor(event_history[start:end],  dtype=torch.float32),
                     ))
 
         def __len__(self):  return len(self.samples)
@@ -1010,15 +1043,16 @@ def train(maps_dir, out_path, max_maps, epochs, extra_dirs=None):
     model.to(device)
     params = sum(p.numel() for p in model.parameters())
 
-    print(f"Model       : ManiaCNNLSTM  |  device: {device}  |  params: {params:,}")
+    print(f"Model       : ManiaARModel  |  device: {device}  |  params: {params:,}")
     print(f"Features    :")
     print(f"  mel({N_MEL}) + onset(1) + onset_harm(1) + onset_perc(1)")
     print(f"  + SC({N_SC}) + chroma({N_CHROMA}) + rms(1) + flatness(1)")
     print(f"  + centroid(1) + zcr(1) + phases_4scales(8)")
-    print(f"  = {FEAT_DIM_AUDIO} audio  +  {FEAT_DIM_CTX} ctx  +  {FEAT_DIM_COL_HIST} col_hist  =  {FEAT_DIM} total")
+    print(f"  = {FEAT_DIM_AUDIO} audio  +  {FEAT_DIM_CTX} ctx  =  {FEAT_DIM} total")
+    print(f"  + event_emb_dim={EVENT_EMB_DIM} (decoder only, teacher-forced from ground truth)")
     print(f"Grid        : SUBDIV={SUBDIV}  |  4 difficulty heads  |  {NUM_PATTERNS} pattern classes")
-    print(f"Hyperparams : d_model={D_MODEL}  lstm_hidden={LSTM_HIDDEN}  "
-          f"lstm_layers={LSTM_LAYERS}  dropout={DROPOUT}\n")
+    print(f"Hyperparams : d_model={D_MODEL}  lstm_hidden={LSTM_HIDDEN}  lstm_layers={LSTM_LAYERS}")
+    print(f"             dec_hidden={DEC_HIDDEN}  dec_layers={DEC_LAYERS}  dropout={DROPOUT}\n")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=2e-4)
 
@@ -1032,11 +1066,11 @@ def train(maps_dir, out_path, max_maps, epochs, extra_dirs=None):
     SIBLING_WEIGHT = 0.2
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
-    history = {"total": [], "hit": [], "ln": [], "ln_dur": [], "pattern": [], "pat_acc": []}
+    history = {"total": [], "hit": [], "ln": [], "ln_dur": [], "pattern": [], "density": [], "pat_acc": []}
     # Accumulate ground-truth pattern distribution once (first pass)
     pat_gt_dist = np.zeros(NUM_PATTERNS, dtype=np.int64)
     for batch in loader:
-        _, _, _, _, y_pat, _ = batch
+        _, _, _, _, y_pat, _, _ = batch
         for p in y_pat.reshape(-1).tolist():
             pat_gt_dist[int(p)] += 1
     history["pat_gt_dist"] = pat_gt_dist.tolist()
@@ -1054,31 +1088,33 @@ def train(maps_dir, out_path, max_maps, epochs, extra_dirs=None):
     for k, (n, w) in enumerate(zip(PATTERN_NAMES, raw_w.tolist())):
         print(f"  {k:2d} {n:<16s} count={pat_gt_dist[k]:8d}  weight={w:.3f}")
     print()
+    print(f"Starting training — {len(dataset)} sequences  |  {len(loader)} batches/epoch\n")
 
     for epoch in range(1, epochs + 1):
         model.train()
-        totals = {"total": 0.0, "hit": 0.0, "ln": 0.0, "ln_dur": 0.0, "pattern": 0.0}
+        totals = {"total": 0.0, "hit": 0.0, "ln": 0.0, "ln_dur": 0.0, "pattern": 0.0, "density": 0.0}
         pat_correct = 0
         pat_total   = 0
         n_batches   = 0
 
-        for batch in loader:
-            X, y_hit, y_ln, y_ln_dur, y_pattern, diff = batch
-            X         = X.to(device)
-            y_hit     = y_hit.to(device)
-            y_ln      = y_ln.to(device)
-            y_ln_dur  = y_ln_dur.to(device)
-            y_pattern = y_pattern.to(device)
-            diff      = diff.to(device)
+        for batch in _tqdm(loader, desc=f"Epoch {epoch:3d}/{epochs}", leave=False):
+            X, y_hit, y_ln, y_ln_dur, y_pattern, diff, event_history = batch
+            X             = X.to(device)
+            y_hit         = y_hit.to(device)
+            y_ln          = y_ln.to(device)
+            y_ln_dur      = y_ln_dur.to(device)
+            y_pattern     = y_pattern.to(device)
+            diff          = diff.to(device)
 
             optimizer.zero_grad()
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                all_heads, pattern_logits = model(X, diff)
+                all_heads, pattern_logits = model(X, diff, event_history.to(device))
 
-                loss     = torch.tensor(0.0, device=device)
-                l_hit    = torch.tensor(0.0, device=device)
-                l_ln     = torch.tensor(0.0, device=device)
-                l_ln_dur = torch.tensor(0.0, device=device)
+                loss      = torch.tensor(0.0, device=device)
+                l_hit     = torch.tensor(0.0, device=device)
+                l_ln      = torch.tensor(0.0, device=device)
+                l_ln_dur  = torch.tensor(0.0, device=device)
+                l_density = torch.tensor(0.0, device=device)
 
                 # ── Per-difficulty losses ──────────────────────────────────────
                 for d in range(DIFF_LEVELS):
@@ -1115,7 +1151,26 @@ def train(maps_dir, out_path, max_maps, epochs, extra_dirs=None):
                         loss     = loss + _ld
                         l_ln_dur = l_ln_dur + _ld
 
-                # 4. Pattern type auxiliary loss (all samples, class-weighted)
+                    # 4. Density-aware loss — penalise density mismatch in ~2 s windows.
+                    # The model learns to regulate how many notes it places per section,
+                    # not just which positions are note-worthy.
+                    hit_prob_d = torch.sigmoid(hit_logits[mask])   # (N, T, 4)
+                    y_hit_d    = y_hit[mask]                        # (N, T, 4)
+                    T_seq      = hit_prob_d.shape[1]
+                    if T_seq >= DENSITY_WIN:
+                        dens_pred, dens_true = [], []
+                        for ws in range(0, T_seq - DENSITY_WIN + 1, DENSITY_STRIDE):
+                            we = ws + DENSITY_WIN
+                            # mean across steps and columns → scalar per sample in [0,1]
+                            dens_pred.append(hit_prob_d[:, ws:we, :].mean(dim=(1, 2)))
+                            dens_true.append(y_hit_d[:, ws:we, :].mean(dim=(1, 2)))
+                        dp  = torch.stack(dens_pred, dim=1)   # (N, n_windows)
+                        dt_ = torch.stack(dens_true, dim=1)
+                        _ldns      = DENSITY_WEIGHT * F.l1_loss(dp, dt_)
+                        loss       = loss + _ldns
+                        l_density  = l_density + _ldns
+
+                # 5. Pattern type auxiliary loss (all samples, class-weighted)
                 l_pat = 0.25 * F.cross_entropy(
                     pattern_logits.reshape(-1, NUM_PATTERNS),
                     y_pattern.reshape(-1),
@@ -1151,6 +1206,7 @@ def train(maps_dir, out_path, max_maps, epochs, extra_dirs=None):
             totals["ln"]      += l_ln.item()
             totals["ln_dur"]  += l_ln_dur.item()
             totals["pattern"] += l_pat.item()
+            totals["density"] += l_density.item()
 
             # Pattern accuracy
             with torch.no_grad():
@@ -1169,6 +1225,7 @@ def train(maps_dir, out_path, max_maps, epochs, extra_dirs=None):
 
         print(f"  Epoch {epoch:3d}/{epochs}  loss: {history['total'][-1]:.4f}  "
               f"hit: {history['hit'][-1]:.3f}  ln: {history['ln'][-1]:.3f}  "
+              f"dens: {history['density'][-1]:.3f}  "
               f"pat: {history['pattern'][-1]:.3f}  pat_acc: {history['pat_acc'][-1]*100:.1f}%  "
               f"lr: {optimizer.param_groups[0]['lr']:.2e}")
 
@@ -1180,12 +1237,12 @@ def train(maps_dir, out_path, max_maps, epochs, extra_dirs=None):
 
     with torch.no_grad():
         for batch in loader:
-            X, y_hit, y_ln, y_ln_dur, y_pattern, diff = batch
+            X, y_hit, y_ln, y_ln_dur, y_pattern, diff, event_history = batch
             X         = X.to(device)
             y_pattern = y_pattern.to(device)
             diff      = diff.to(device)
 
-            all_heads, pattern_logits = model(X, diff)
+            all_heads, pattern_logits = model(X, diff, event_history.to(device))
 
             pred_pat = pattern_logits.reshape(-1, NUM_PATTERNS).argmax(dim=-1).cpu().numpy()
             true_pat = y_pattern.reshape(-1).cpu().numpy()
@@ -1203,7 +1260,7 @@ def train(maps_dir, out_path, max_maps, epochs, extra_dirs=None):
                     col_balance[DIFF_NAMES[di]][col] += int(hit_pred[:, :, col].sum())
 
     torch.save({
-        "model_type":        "ManiaCNNLSTM",
+        "model_type":        "ManiaARModel",
         "feat_dim":          FEAT_DIM,
         "feat_dim_audio":    FEAT_DIM_AUDIO,
         "feat_dim_ctx":      FEAT_DIM_CTX,
@@ -1220,6 +1277,9 @@ def train(maps_dir, out_path, max_maps, epochs, extra_dirs=None):
         "dropout":        DROPOUT,
         "max_ln_beats":   MAX_LN_BEATS,
         "num_patterns":   NUM_PATTERNS,
+        "event_emb_dim":  EVENT_EMB_DIM,
+        "dec_hidden":     DEC_HIDDEN,
+        "dec_layers":     DEC_LAYERS,
         "model_state":    model.state_dict(),
         "maps_trained":   len(sequences),
     }, out_path)
@@ -1354,7 +1414,7 @@ def save_training_report(history, conf_matrix, col_balance, out_path):
     ax.set_ylabel("%", color=DIM, fontsize=8)
     ax.legend(fontsize=8, facecolor=SURF, edgecolor="#3a2d62", labelcolor=DIM)
 
-    fig.suptitle("ManiaCNNLSTM — Training Report", color=PINK, fontsize=12, y=0.97)
+    fig.suptitle("ManiaARModel — Training Report", color=PINK, fontsize=12, y=0.97)
 
     report_path = os.path.splitext(out_path)[0] + "_training_report.png"
     plt.savefig(report_path, dpi=140, bbox_inches="tight", facecolor=BG)
