@@ -379,8 +379,6 @@ def extract_audio_features_cached(audio_path, cache_dir):
       1. In-memory dict — free for same audio used by multiple .osu files.
       2. Disk .npz — survives across training runs; invalidated if audio changes.
     """
-    global _MEM_CACHE
-
     abs_path = os.path.abspath(audio_path)
     if abs_path in _MEM_CACHE:
         return _MEM_CACHE[abs_path]
