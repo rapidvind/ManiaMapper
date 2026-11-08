@@ -120,6 +120,11 @@ LSTM: 256 hidden, 3 layers, dropout=0.3
 
 | File | Description |
 |------|-------------|
-| `ManiaMapper.py` | Main beatmap generator |
-| `ManiaNNTrainer.py` | LSTM trainer for custom models |
-| `mania_nn_model.pt` | Trained model weights (not included — train your own) |
+| `ManiaMapper.py` | Beatmap generator — CLI and Tkinter GUI (`--ui`) |
+| `ManiaNNTrainer.py` | Trains the model from a folder of `.osu` maps |
+| `app.py` | FastAPI backend serving the web app |
+| `static/index.html` | Web app frontend, served by `app.py` |
+| `requirements.txt` | Python dependencies |
+| `mania_model_training_report.png` | Diagnostics from the last training run (see [Results](#results)) |
+| `training_log.txt` | Raw console log from the last training run (see [Results](#results)) |
+| `mania_model.pt` | Trained model weights — **not included**, gitignored; train your own |
