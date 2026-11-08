@@ -116,6 +116,20 @@ LSTM: 256 hidden, 3 layers, dropout=0.3
 
 ---
 
+## Results
+
+Numbers below are from `training_log.txt`, the log of the training run that also produced `mania_model_training_report.png` (both committed in this repo). No model weights are included — see [Train a custom model](#train-a-custom-model) above.
+
+**Dataset:** 127 usable maps out of 151 scanned `.osu` files (Easy: 14, Normal: 21, Hard: 52, Insane: 40), built into 2,408 training sequences of 256 steps each. 222,013 regular notes and 45,807 LN notes (LN ratio 0.171). 20 audio files had 2+ difficulties available, used for cross-difficulty context.
+
+**Training:** 50/50 epochs, on GPU (cuda), ~6.97M parameters. Final epoch — total loss 0.3044 (hit-placement BCE 0.016, LN-placement BCE 0.167, pattern classification CE 0.076), pattern-classification accuracy 90.1%. The training report below additionally plots an LN-duration MSE curve not broken out in the text log.
+
+That 90.1% is **training-set accuracy** — the trainer doesn't hold out a validation split, so it measures fit to the training data, not generalization to unseen maps.
+
+![Training report: loss curves, pattern accuracy, confusion matrix, and dataset diagnostics](mania_model_training_report.png)
+
+---
+
 ## Files
 
 | File | Description |
