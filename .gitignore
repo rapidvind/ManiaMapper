@@ -10,8 +10,10 @@ env/
 ManiaStyles/
 _feat_cache/
 
-# Model weights tracked via Git LFS
+# Model weights (too large for git; distribute separately)
 *.onnx
+*.pt
+*.pth
 
 # Generated outputs
 *.osz
