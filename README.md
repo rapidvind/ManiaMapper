@@ -130,6 +130,18 @@ That 90.1% is **training-set accuracy** — the trainer doesn't hold out a valid
 
 ---
 
+## Web app
+
+`app.py` is a FastAPI backend (`uvicorn app:app`) that wraps the CLI generator behind an HTTP API, with `static/index.html` as its frontend. It previously ran on a GCP VM at maniamapper.com; that deployment has since been retired, but the code here is what ran it.
+
+- `POST /api/generate` — accepts an uploaded audio file (`.mp3`/`.ogg`/`.wav`/`.flac`/`.m4a`) plus `difficulty`/`title`/`artist` form fields, validates them, and shells out to `ManiaMapper.py` as a subprocess (`--nn mania_model.pt --no-sv`, 120s timeout) to generate the map. Returns the resulting `.osz` as a file download.
+- Best-effort album art: before generating, it queries the iTunes Search API for `artist + title`, downloads the top result's artwork, and passes it to `ManiaMapper.py` as the beatmap background — silently skipped if the lookup, download, or image validation fails.
+- `GET /api/health` — reports whether `mania_model.pt` is present on the server.
+- Each request gets its own job directory under `/tmp/maniamapper_jobs`, cleaned up in the background after the response is sent.
+- CORS is wide open (`allow_origins=["*"]`) — fine for a public generate-and-download API with no auth or user state, not something to carry into a service that has either.
+
+---
+
 ## Files
 
 | File | Description |
