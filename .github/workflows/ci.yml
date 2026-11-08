@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt flake8
+
+      - name: Lint (syntax errors / undefined names only)
+        run: flake8 . --select=E9,F63,F7,F82 --show-source
+
+# This workflow only installs dependencies and lints for syntax errors -
+# it does not run ManiaNNTrainer.py or any training. There's no model to
+# train against in CI (no ManiaStyles/ dataset, no GPU), and a real
+# training run takes far longer than a CI job should.
