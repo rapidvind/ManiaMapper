@@ -39,10 +39,12 @@ Audio formats: MP3, OGG, WAV, FLAC.
 ```bash
 python ManiaMapper.py song.mp3
 python ManiaMapper.py song.mp3 --output my_map.osz
-python ManiaMapper.py song.mp3 --nn mania_nn_model.pt
+python ManiaMapper.py song.mp3 --nn mania_model.pt
 ```
 
 You'll be prompted for song title, artist, difficulty level, and whether to add speed variation.
+
+**A trained model is required** — `ManiaMapper.py` looks for `mania_model.pt` next to the script (or at the path passed via `--nn`) and exits with an error if it isn't found. No trained weights are included in this repo; train your own (below).
 
 ### Train a custom model
 
@@ -60,14 +62,14 @@ ManiaStyles/
 └── ...
 ```
 
-Supported style folders: `tech`, `streams`, `complex_streams`, `jump_streams`, `hand_streams`, `ln`, `complex_ln`, `ranked_allround`, `chord_jacks`, `chord_jacks_doubles`
+These style folders are just how training data gets organized on disk for variety — they are not fed to the model as a style label (see [Neural network architecture](#neural-network-architecture)).
 
 ```bash
-python ManiaNNTrainer.py --styles-dir C:\ManiaStyles
-python ManiaNNTrainer.py --styles-dir C:\ManiaStyles --epochs 20 --maps-per-style 300
+python ManiaNNTrainer.py --maps-dir C:\ManiaStyles
+python ManiaNNTrainer.py --maps-dir C:\ManiaStyles --epochs 20 --max-maps 3000
 ```
 
-This produces `mania_nn_model.pt`, which you pass to `ManiaMapper.py` via `--nn`.
+This produces `mania_model.pt` (the `--out` flag changes the path), which you pass to `ManiaMapper.py` via `--nn`.
 
 ---
 
