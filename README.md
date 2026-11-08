@@ -142,6 +142,16 @@ That 90.1% is **training-set accuracy** — the trainer doesn't hold out a valid
 
 ---
 
+## Limitations
+
+- **4K only.** `KEYS = 4` is hardcoded in `ManiaMapper.py`; there's no path to 5K/6K/7K without code changes.
+- **No style conditioning at inference time.** The `ManiaStyles/` folders (`tech`, `streams`, `ln`, etc.) are only how training data happens to be organized on disk — the model has no style input or style head (see [Neural network architecture](#neural-network-architecture)), so generated maps reflect whatever pattern mix the training set as a whole contains, not a style you can select. A style under-represented in training will be under-represented in output.
+- **No objective playability metric.** Training is evaluated on loss and pattern-classification accuracy against the training set — there's no automated check for whether a generated map is actually fun or fair to play; that's a human judgment call per generated map.
+- **No held-out validation split.** The 90.1% pattern accuracy in [Results](#results) is measured on the training data itself, not on unseen maps — it's evidence the model fit the training set, not evidence it generalizes.
+- **One documented training run.** The numbers in [Results](#results) are from a single run (127 maps, 50 epochs) — no hyperparameter sweep or cross-validation was done.
+
+---
+
 ## Files
 
 | File | Description |
