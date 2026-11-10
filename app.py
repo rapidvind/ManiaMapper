@@ -4,8 +4,8 @@ ManiaMapper Web API
 FastAPI backend that accepts an audio file upload and returns a generated .osz file.
 
 Endpoints:
-    POST /api/generate   — upload audio, returns .osz download
-    GET  /api/health     — health check
+    POST /api/generate   : upload audio, returns .osz download
+    GET  /api/health     : health check
 
 Usage:
     uvicorn app:app --host 0.0.0.0 --port 8000
@@ -107,7 +107,7 @@ async def generate(
                     if w >= 100 and h >= 100:
                         bg_path = candidate
         except Exception:
-            bg_path = None   # silently skip — map still generates without background
+            bg_path = None   # silently skip, map still generates without background
 
     # ── Run ManiaMapper ───────────────────────────────────────────────────────
     safe = lambda s: "".join(c for c in s if c.isalnum() or c in " -_") or "map"

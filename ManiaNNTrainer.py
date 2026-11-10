@@ -1,21 +1,21 @@
 """
-ManiaNNTrainer.py  —  osu!mania 4K trainer  (v4)
+ManiaNNTrainer.py: osu!mania 4K trainer (v4)
 =================================================
 What's new in v4
 -----------------
   Features (114 audio + 16 cross-diff context = 130 total):
-    mel spectrogram (80)        — tonal content, main signal
-    onset strength (1)          — WHEN hits occur
-    onset_harm (1)              — onset on harmonic component
-    onset_perc (1)              — onset on percussive component
-    spectral contrast (7)       — peak/valley texture
-    chroma CQT (12)             — harmonic/melodic content
-    RMS energy (1)              — loudness
-    spectral flatness (1)       — noisy vs tonal
-    spectral centroid (1)       — brightness, normalized 0-1
-    zero crossing rate (1)      — noisiness indicator
-    phases @ 4 temporal scales  — 8 dims (sin/cos × 4 scales: 1,2,4,8 beat)
-    cross-diff context (16)     — sibling map hit_labels for same audio
+    mel spectrogram (80)        : tonal content, main signal
+    onset strength (1)          : WHEN hits occur
+    onset_harm (1)              : onset on harmonic component
+    onset_perc (1)              : onset on percussive component
+    spectral contrast (7)       : peak/valley texture
+    chroma CQT (12)             : harmonic/melodic content
+    RMS energy (1)              : loudness
+    spectral flatness (1)       : noisy vs tonal
+    spectral centroid (1)       : brightness, normalized 0-1
+    zero crossing rate (1)      : noisiness indicator
+    phases @ 4 temporal scales  : 8 dims (sin/cos × 4 scales: 1,2,4,8 beat)
+    cross-diff context (16)     : sibling map hit_labels for same audio
 
   Architecture: PatternConvBlock(k=3,5,9,13) + Transformer + 4 DiffHeads
     + pattern auxiliary head (18 pattern classes)
@@ -75,7 +75,7 @@ DENSITY_WIN    = 48    # ~2 s window at 32nd-note grid (172 BPM ≈ 43 ms/step �
 DENSITY_STRIDE = 24    # 50 % overlap between windows
 DENSITY_WEIGHT = 5.0   # L1 weight relative to hit BCE loss
 
-# Pattern constants — 18 classes
+# Pattern constants: 18 classes
 PATTERN_REST          = 0
 PATTERN_SINGLE        = 1
 PATTERN_CHORD_2       = 2
@@ -376,8 +376,8 @@ def _cache_path(audio_path, cache_dir):
 def extract_audio_features_cached(audio_path, cache_dir):
     """
     Like extract_audio_features() but with two caching layers:
-      1. In-memory dict — free for same audio used by multiple .osu files.
-      2. Disk .npz — survives across training runs; invalidated if audio changes.
+      1. In-memory dict: free for same audio used by multiple .osu files.
+      2. Disk .npz: survives across training runs; invalidated if audio changes.
     """
     abs_path = os.path.abspath(audio_path)
     if abs_path in _MEM_CACHE:
@@ -399,7 +399,7 @@ def extract_audio_features_cached(audio_path, cache_dir):
                 _MEM_CACHE[abs_path] = result
                 return result
         except Exception:
-            pass   # corrupt cache — recompute below
+            pass   # corrupt cache, recompute below
 
     result = extract_audio_features(audio_path)
     if result is None:
@@ -426,9 +426,9 @@ def extract_labels(groups, positions, beat_length):
     """
     Map hit groups to label arrays.
     Returns:
-        hit_labels:  (T, 4) float32 — 1 if any note (hit or LN start) in column
-        ln_labels:   (T, 4) float32 — 1 if note is a long note
-        ln_dur_lbls: (T, 4) float32 — LN duration in beats (0 for non-LN)
+        hit_labels:  (T, 4) float32, 1 if any note (hit or LN start) in column
+        ln_labels:   (T, 4) float32, 1 if note is a long note
+        ln_dur_lbls: (T, 4) float32, LN duration in beats (0 for non-LN)
     """
     step_ms = beat_length / SUBDIV
     TOL_MS  = max(step_ms * 0.6, 20.0)
@@ -458,7 +458,7 @@ def extract_labels(groups, positions, beat_length):
 
 def derive_pattern_types(hit_labels, ln_labels, ln_dur_lbls):
     """
-    Derive pattern type for each timestep — 18-class system.
+    Derive pattern type for each timestep: 18-class system.
     Two-pass: pass 1 labels forward (same as before), pass 2 retroactively
     extends trill/jack/stream labels back to the actual start of each region
     so the model sees consistent labels for entire pattern runs, not just the
@@ -567,7 +567,7 @@ def derive_pattern_types(hit_labels, ln_labels, ln_dur_lbls):
         pattern_types[t] = PATTERN_CHORD_2 if n_active == 2 else PATTERN_CHORD_3
 
     # ── Pass 2: retroactive relabeling ───────────────────────────────────────
-    # 2a. Trills — when a trill is confirmed at t, walk backward through
+    # 2a. Trills: when a trill is confirmed at t, walk backward through
     #     non-empty steps while they match the same cyclic unit; relabel them
     #     so the entire trill run carries a consistent label.
     for t in range(T):
@@ -612,7 +612,7 @@ def derive_pattern_types(hit_labels, ln_labels, ln_dur_lbls):
             if step_sigs[s] and pattern_types[s] not in LN_CLASSES:
                 pattern_types[s] = trill_class
 
-    # 2b. Jacks — when a JACK is confirmed, walk backward through non-empty
+    # 2b. Jacks: when a JACK is confirmed, walk backward through non-empty
     #     single-note-same-col steps that were labeled SINGLE and relabel them.
     for t in range(T):
         if pattern_types[t] != PATTERN_JACK:
@@ -634,7 +634,7 @@ def derive_pattern_types(hit_labels, ln_labels, ln_dur_lbls):
             else:
                 break
 
-    # 2c. Streams — relabel the lead-in steps (first 7 grid steps before the
+    # 2c. Streams: relabel the lead-in steps (first 7 grid steps before the
     #     stream density threshold is met) if they were labeled SINGLE/JACK/CHORD.
     for t in range(T):
         if pattern_types[t] not in STREAM_CLASSES:
@@ -655,7 +655,7 @@ def extract_features_and_labels(audio_path, groups, version_str, cache_dir=None)
     """
     Returns (feat_audio, hit_labels, ln_labels, ln_dur_lbls, pattern_types, diff_level, audio_path)
     or (None,)*7.
-    feat_audio: (T, FEAT_DIM_AUDIO) — cross-diff context added later.
+    feat_audio: (T, FEAT_DIM_AUDIO), cross-diff context added later.
     """
     if cache_dir:
         result = extract_audio_features_cached(audio_path, cache_dir)
@@ -750,7 +750,7 @@ def build_model(feat_dim=FEAT_DIM, diff_levels=DIFF_LEVELS, diff_emb=DIFF_EMB,
 
     class PatternConvBlock(nn.Module):
         """
-        Multi-scale 1D depthwise convolution — captures local note patterns.
+        Multi-scale 1D depthwise convolution: captures local note patterns.
         k=3  -> note pairs (jacks, 2-note bursts)
         k=5  -> trills and short streams
         k=9  -> longer streams (8-note runs)
@@ -814,7 +814,7 @@ def build_model(feat_dim=FEAT_DIM, diff_levels=DIFF_LEVELS, diff_emb=DIFF_EMB,
             # ── Difficulty embedding ──────────────────────────────────────────────
             self.diff_emb    = nn.Embedding(diff_levels, diff_emb)
 
-            # ── Audio encoder (bidirectional — same as before) ────────────────────
+            # ── Audio encoder (bidirectional, same as before) ────────────────────
             self.input_proj  = nn.Linear(feat_dim + diff_emb, d_model)
             self.conv1       = PatternConvBlock(d_model, drop=dropout)
             self.conv2       = PatternConvBlock(d_model, drop=dropout)
@@ -867,7 +867,7 @@ def build_model(feat_dim=FEAT_DIM, diff_levels=DIFF_LEVELS, diff_emb=DIFF_EMB,
             """
             Run decoder over a sequence.
             audio_ctx    : (B, T, d_model)
-            event_history: (B, T, 8) — shifted ground truth events for teacher forcing,
+            event_history: (B, T, 8), shifted ground truth events for teacher forcing,
                            or model predictions for autoregressive inference
             hc           : optional initial LSTM state (for chunked inference)
             Returns: (dec_out (B, T, dec_hidden), new_hc)
@@ -882,7 +882,7 @@ def build_model(feat_dim=FEAT_DIM, diff_levels=DIFF_LEVELS, diff_emb=DIFF_EMB,
             Full forward pass for training (teacher forcing).
             x            : (B, T, feat_dim)
             diff         : (B,)
-            event_history: (B, T, 8)  — ground truth events shifted by 1
+            event_history: (B, T, 8)  : ground truth events shifted by 1
             Returns: (head_outputs, pattern_logits)
             """
             audio_ctx      = self.encode_audio(x, diff)
@@ -1086,7 +1086,7 @@ def train(maps_dir, out_path, max_maps, epochs, extra_dirs=None):
     for k, (n, w) in enumerate(zip(PATTERN_NAMES, raw_w.tolist())):
         print(f"  {k:2d} {n:<16s} count={pat_gt_dist[k]:8d}  weight={w:.3f}")
     print()
-    print(f"Starting training — {len(dataset)} sequences  |  {len(loader)} batches/epoch\n")
+    print(f"Starting training: {len(dataset)} sequences  |  {len(loader)} batches/epoch\n")
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -1149,7 +1149,7 @@ def train(maps_dir, out_path, max_maps, epochs, extra_dirs=None):
                         loss     = loss + _ld
                         l_ln_dur = l_ln_dur + _ld
 
-                    # 4. Density-aware loss — penalise density mismatch in ~2 s windows.
+                    # 4. Density-aware loss: penalise density mismatch in ~2 s windows.
                     # The model learns to regulate how many notes it places per section,
                     # not just which positions are note-worthy.
                     hit_prob_d = torch.sigmoid(hit_logits[mask])   # (N, T, 4)
@@ -1302,7 +1302,7 @@ DIFF_NAMES    = ["Easy", "Normal", "Hard", "Insane"]
 def save_training_report(history, conf_matrix, col_balance, out_path):
     """
     Save a training report PNG next to the model file.
-    history     : dict of lists — keys: total, hit, ln, ln_dur, pattern, pat_acc
+    history     : dict of lists, keys: total, hit, ln, ln_dur, pattern, pat_acc
     conf_matrix : (NUM_PATTERNS, NUM_PATTERNS) numpy array
     col_balance : dict[diff_name] -> list[4] note counts per column
     """
@@ -1412,7 +1412,7 @@ def save_training_report(history, conf_matrix, col_balance, out_path):
     ax.set_ylabel("%", color=DIM, fontsize=8)
     ax.legend(fontsize=8, facecolor=SURF, edgecolor="#3a2d62", labelcolor=DIM)
 
-    fig.suptitle("ManiaARModel — Training Report", color=PINK, fontsize=12, y=0.97)
+    fig.suptitle("ManiaARModel: Training Report", color=PINK, fontsize=12, y=0.97)
 
     report_path = os.path.splitext(out_path)[0] + "_training_report.png"
     plt.savefig(report_path, dpi=140, bbox_inches="tight", facecolor=BG)

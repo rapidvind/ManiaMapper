@@ -221,7 +221,7 @@ def analyze_audio(audio_path):
         return f
 
     feat_audio = np.stack([feat_at(t) for t in positions])   # (T, 114)
-    # Pad ctx with zeros (no col_hist — handled by decoder event embeddings)
+    # Pad ctx with zeros (no col_hist, handled by decoder event embeddings)
     feat_full  = np.concatenate(
         [feat_audio,
          np.zeros((len(positions), _NN_FEAT_DIM_CTX), dtype=np.float32)],
@@ -240,7 +240,7 @@ def analyze_audio(audio_path):
 
 def _build_cnn_lstm_legacy(feat_dim, diff_levels, diff_emb, d_model, lstm_hidden,
                            lstm_layers, dropout, max_ln_beats=16.0, num_patterns=18):
-    """Build ManiaCNNLSTM — CNN front-end + BiLSTM backbone (legacy checkpoints)."""
+    """Build ManiaCNNLSTM: CNN front-end + BiLSTM backbone (legacy checkpoints)."""
     import torch
     import torch.nn as nn
 
@@ -329,7 +329,7 @@ def _build_cnn_lstm_legacy(feat_dim, diff_levels, diff_emb, d_model, lstm_hidden
 def _build_ar_model(feat_dim, diff_levels, diff_emb, d_model, lstm_hidden,
                     lstm_layers, dropout, event_emb_dim, dec_hidden, dec_layers,
                     max_ln_beats=16.0, num_patterns=18):
-    """Build ManiaARModel — Audio Encoder (BiLSTM) + Pattern Decoder (causal LSTM)."""
+    """Build ManiaARModel: Audio Encoder (BiLSTM) + Pattern Decoder (causal LSTM)."""
     import torch
     import torch.nn as nn
 
@@ -421,7 +421,7 @@ def _build_ar_model(feat_dim, diff_levels, diff_emb, d_model, lstm_hidden,
 
 def _build_transformer_v4(feat_dim, diff_levels, diff_emb, d_model, nhead,
                            num_layers, dim_ff, dropout, max_ln_beats=16.0, num_patterns=9):
-    """Legacy builder — loads old ManiaTransformerV4 checkpoints."""
+    """Legacy builder: loads old ManiaTransformerV4 checkpoints."""
     import torch
     import torch.nn as nn
     import math
@@ -717,7 +717,7 @@ def _diversify_patterns(notes, min_gap_col=None):
             # Skip chord-spanning and LN notes
             if notes[k][0] == notes[k+1][0] or notes[k+1][0] == notes[k+2][0]:
                 continue
-            if notes[k+2][2]:  # is_ln — don't move LN notes
+            if notes[k+2][2]:  # is_ln, don't move LN notes
                 continue
             if notes[k+2][0] in ln_times:
                 continue
@@ -902,7 +902,7 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord
                 i = j
 
         # Compute rolling thresholds from the scan pass
-        # LN threshold targets 8% LN rate — top 8% of positions by model LN confidence
+        # LN threshold targets 8% LN rate: top 8% of positions by model LN confidence
         target_ln_pct = 0.08
         ln_threshold  = max(float(np.percentile(all_ln_p, (1.0 - target_ln_pct) * 100)), 1e-4)
         chord_fill    = float(DIFFICULTY_PRESETS.get(difficulty, {}).get("chord_fill", 0.12))
@@ -986,7 +986,7 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord
                 cumulative_target += nps_ceiling * dt_s
                 prev_t_ms = t
                 pacing_ratio = notes_placed_total / max(cumulative_target, 0.1)
-                # Clamp to [0.80, 1.20] — only a gentle nudge, not a flood gate
+                # Clamp to [0.80, 1.20]: only a gentle nudge, not a flood gate
                 pace_factor  = float(np.clip(pacing_ratio, 0.80, 1.20))
                 paced_thr    = thresholds[i] * pace_factor
                 paced_c_thr  = c_thresholds[i] * pace_factor
@@ -999,14 +999,14 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord
                     rp           = list(recent_placements)  # [(time, col), ...]
 
                     def col_score_factors(col):
-                        # 1. Jack penalty — same column within 350ms: 92% reduction
+                        # 1. Jack penalty: same column within 350ms: 92% reduction
                         for pt, pc in reversed(rp):
                             if t - pt >= 350:
                                 break
                             if pc == col:
                                 return 0.08
 
-                        # 2. Column freshness — boost columns not used recently.
+                        # 2. Column freshness: boost columns not used recently.
                         #    Time since this column last appeared in recent history.
                         #    Longer gap → higher boost (max 2.0×).  Breaks fixed cycles
                         #    without imposing rigid direction rules.
@@ -1037,7 +1037,7 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord
                     if not eligible:
                         notes_to_place = []
                     else:
-                        # Weighted sampling from eligible cols — breaks deterministic cycles.
+                        # Weighted sampling from eligible cols: breaks deterministic cycles.
                         # Primary note: sample proportional to score^2 (sharpens preference
                         # without always taking the argmax).
                         import random
@@ -1075,7 +1075,7 @@ def generate_notes(audio_data, nn_model_data, fill, difficulty="Hard", max_chord
                         ev_np[4 + col] = 1.0
                 ev_t = torch.tensor(ev_np, dtype=torch.float32).reshape(1, 1, 8).to(device)
 
-        # Only fill sparse gaps — the AR model handles patterns itself
+        # Only fill sparse gaps: the AR model handles patterns itself
         placed = _fill_sparse_windows(placed, ar_probs, positions, min_gap_col=min_gap_col)
         return placed, {"all_prob": ar_probs, "positions": positions, "threshold": threshold}
 
@@ -1313,7 +1313,7 @@ def save_analysis(notes, analysis, audio_data, settings, output_dir):
 
     # ════════════════════════ LEFT: SONG SIGNALS ═══════════════════════════════
 
-    # Row 0 — Onset strength + RMS energy
+    # Row 0: Onset strength + RMS energy
     ax_ons = _ax(gs_l[0])
     onset_raw = audio_data["onset"]
     ax_ons.fill_between(frame_sec[:len(onset_raw)], onset_raw,
@@ -1328,7 +1328,7 @@ def save_analysis(notes, analysis, audio_data, settings, output_dir):
     ax_ons.set_ylabel("Onset / RMS", color="#9d8cbb", fontsize=8)
     ax_ons.set_title("SONG SIGNALS", color="#9d8cbb", fontsize=9, loc="left", pad=4)
 
-    # Row 1 — Chroma heatmap (harmonic content)
+    # Row 1: Chroma heatmap (harmonic content)
     ax_chr = _ax(gs_l[1])
     chroma = audio_data["chroma"]           # (12, T_frames)
     note_names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
@@ -1339,7 +1339,7 @@ def save_analysis(notes, analysis, audio_data, settings, output_dir):
     ax_chr.set_yticklabels(note_names, color="#9d8cbb", fontsize=6)
     ax_chr.set_ylabel("Chroma", color="#9d8cbb", fontsize=8)
 
-    # Row 2 — Spectral contrast (texture)
+    # Row 2: Spectral contrast (texture)
     ax_sc = _ax(gs_l[2])
     sc = audio_data["sc"]                   # (7, T_frames)
     sc_mean = sc.mean(axis=0)
@@ -1348,7 +1348,7 @@ def save_analysis(notes, analysis, audio_data, settings, output_dir):
     ax_sc.plot(frame_sec[:len(sc_mean)], sc_mean, color="#4aa8d4", linewidth=0.5)
     ax_sc.set_ylabel("Spec. Contrast", color="#9d8cbb", fontsize=8)
 
-    # Row 3 — Beat grid markers
+    # Row 3: Beat grid markers
     ax_bt = _ax(gs_l[3], hide_x=False)
     for bt in audio_data["beat_times"] / 1000:
         if 0 <= bt <= duration:
@@ -1358,7 +1358,7 @@ def save_analysis(notes, analysis, audio_data, settings, output_dir):
 
     # ════════════════════════ RIGHT: MAP SIGNALS ═══════════════════════════════
 
-    # Rows 0-3 — Per-column probability traces
+    # Rows 0-3: Per-column probability traces
     for col in range(4):
         ax = _ax(gs_r[col])
         p  = all_prob[:, col] if len(all_prob) else []
@@ -1373,7 +1373,7 @@ def save_analysis(notes, analysis, audio_data, settings, output_dir):
         if col == 0:
             ax.set_title("MAP SIGNALS", color="#9d8cbb", fontsize=9, loc="left", pad=4)
 
-    # Row 4 — Note piano-roll
+    # Row 4: Note piano-roll
     ax_n = _ax(gs_r[4])
     if notes:
         nt = [n[0] / 1000 for n in notes]
@@ -1385,7 +1385,7 @@ def save_analysis(notes, analysis, audio_data, settings, output_dir):
     ax_n.set_yticklabels(["C1", "C2", "C3", "C4"], color="#9d8cbb", fontsize=7)
     ax_n.set_ylabel("Notes", color="#9d8cbb", fontsize=8)
 
-    # Row 5 — NPS density over time
+    # Row 5: NPS density over time
     ax_d = _ax(gs_r[5], hide_x=False)
     if notes and duration > 0:
         bin_w   = 1.0
@@ -1571,7 +1571,7 @@ def _pill_photo(w, h, text, fill_hex, parent_bg_hex,
     try:
         draw.rounded_rectangle([0, 0, W - 1, H - 1], radius=r, fill=fl_rgb)
     except AttributeError:
-        # Pillow < 8.2 — manual arcs
+        # Pillow < 8.2: manual arcs
         d = 2 * r
         draw.ellipse([0, 0, d - 1, d - 1],             fill=fl_rgb)
         draw.ellipse([W - d, 0, W - 1, d - 1],         fill=fl_rgb)
@@ -1938,16 +1938,16 @@ class ManiaMapperGUI:
             self._sv_var.set(not self._sv_var.get())
             _draw_sv()
             _sv_lbl.config(
-                text=("Enabled  —  scroll speed follows energy"
+                text=("Enabled: scroll speed follows energy"
                       if self._sv_var.get() else
-                      "Disabled  —  constant scroll speed"),
+                      "Disabled: constant scroll speed"),
                 fg=self.PINK_LT if self._sv_var.get() else self.MUTE,
             )
 
         track.bind("<Button-1>", _toggle)
 
         _sv_lbl = tk.Label(row,
-                           text="Disabled  —  constant scroll speed",
+                           text="Disabled: constant scroll speed",
                            font=("Segoe UI", 10),
                            fg=self.MUTE, bg=self.SURF)
         _sv_lbl.pack(side="left", padx=(14, 0))
@@ -2069,7 +2069,7 @@ class ManiaMapperGUI:
             upd(15, f"Analysing audio  ·  {os.path.basename(settings['audio_path'])}")
             audio = analyze_audio(settings["audio_path"])
 
-            upd(55, "Running Transformer — generating notes…")
+            upd(55, "Running Transformer: generating notes…")
             d               = DIFFICULTY_PRESETS[settings["difficulty"]]
             notes, analysis = generate_notes(audio, nn, fill=d["fill"],
                                              difficulty=settings["difficulty"],
